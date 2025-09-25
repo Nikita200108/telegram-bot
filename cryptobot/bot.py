@@ -27,6 +27,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from flask import Flask, request
+# ---------------- Flask ----------------
+app = Flask(__name__)
+
 from dotenv import load_dotenv
 
 # ---------------- Configuration ----------------
@@ -50,6 +53,20 @@ ANSWER_CB = BOT_API + "/answerCallbackQuery"
 CHAT_ID_ADMIN = int(os.getenv("CHAT_ID_ADMIN") or 0)
 PORT = int(os.getenv("PORT") or 8000)
 DB_PATH = os.getenv("DB_PATH") or "bot_data.sqlite"
+
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    try:
+        update = request.get_json()
+        logger.info(f"Получен апдейт: {update}")
+
+        # Здесь вызови свою функцию обработки апдейтов
+        # например:
+        # process_update(update)
+
+    except Exception as e:
+        logger.error(f"Ошибка в webhook: {e}")
+    return "OK", 200
 
 # default symbols available initially
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "NEAR/USDT"]
