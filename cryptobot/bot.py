@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Полный bot.py — интегрированный:
-- Flask webhook (маршрут /<TELEGRAM_TOKEN>)
-- MEXC via ccxt (fetch_ticker, fetch_ohlcv)
-- SQLite persistence (users, user_symbols, alerts, history, logs)
-- Reply keyboard (главное меню) + inline клавиатуры (интервалы, монеты, шаги цены)
-- Сигналы: above/below/cross, одноразовые/recurring, time window
-- Автоподтверждение (autotime)
-- Charts: candlestick (1m,5m,15m,30m,1h,4h,1d) via ccxt.fetch_ohlcv + matplotlib, отправка в чат (без сохранения)
-- Логирование и защита от падений
-- Токен: берётся из окружения, если нет — спрашивается и записывается в .env
+Полный bot.py:
+- Flask webhook на /<TELEGRAM_TOKEN>
+- MEXC via ccxt (цены + fetch_ohlcv для графиков)
+- SQLite: users, user_symbols (индивидуальные), alerts, history, logs
+- Reply-клавиатура (главное меню) + Inline кнопки (монеты/интервалы/шаги/удаление)
+- Добавление/удаление монет пользователем
+- Charts: 1m,5m,15m,30m,1h,4h,1d — свечи (green/red)
+- Логирование, устойчивость к ошибкам
+- Токен: берётся из env TELEGRAM_TOKEN или спрашивается и записывается в .env
 """
 
 import os
@@ -18,94 +18,86 @@ import sys
 import time
 import json
 import io
-import math
 import threading
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 
-# External libraries
+# external libs
 try:
     import requests
 except Exception as e:
-    print("Install 'requests' package. Error:", e)
+    print("Установите requests: pip install requests")
     raise
 
 try:
     import ccxt
 except Exception as e:
-    print("Install 'ccxt' package. Error:", e)
+    print("Установите ccxt: pip install ccxt")
     raise
 
-# pandas/matplotlib are optional for charts — we try to import and if missing we'll still run other features
+# charts libs optional
+HAS_CHARTS = True
 try:
     import pandas as pd
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     import numpy as np
-    HAS_CHARTS = True
 except Exception:
     HAS_CHARTS = False
 
-from flask import Flask, request, abort
+from flask import Flask, request
 
-# ---------------- Configuration & token handling ----------------
-
+# ---------------- Config & .env handling ----------------
 ENV_PATH = ".env"
 
-def load_env():
-    """Simple .env loader (only KEY=VALUE lines)."""
+def load_env_file():
     env = {}
     if os.path.exists(ENV_PATH):
         try:
             with open(ENV_PATH, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#") or "=" not in ln:
                         continue
-                    k, v = line.split("=", 1)
+                    k, v = ln.split("=", 1)
                     env[k.strip()] = v.strip()
         except Exception:
             pass
     return env
 
-def save_env(var_dict):
-    """Append or update keys in .env file (simple implementation)."""
-    current = load_env()
-    current.update(var_dict)
+def save_env(updates: dict):
+    current = load_env_file()
+    current.update(updates)
     try:
         with open(ENV_PATH, "w", encoding="utf-8") as f:
             for k, v in current.items():
                 f.write(f"{k}={v}\n")
-    except Exception as e:
+    except Exception:
         logger = logging.getLogger("crypto_bot")
-        logger.exception("Failed to save .env: %s", e)
+        logger.exception("Не удалось записать .env")
 
-# load existing .env values into os.environ if not present
-_env = load_env()
-for k, v in _env.items():
+# merge .env into os.environ if missing
+_envfile = load_env_file()
+for k, v in _envfile.items():
     if k not in os.environ:
         os.environ[k] = v
 
-# Logging setup
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("crypto_bot")
 
-# TELEGRAM_TOKEN: from env or prompt
+# ---------------- TELEGRAM TOKEN ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
+    # run interactively: ask user to paste token, save to .env
     try:
-        # prompt in interactive mode
-        TELEGRAM_TOKEN = input("Введите TELEGRAM_TOKEN (скопируйте из BotFather): ").strip()
+        TELEGRAM_TOKEN = input("Введите TELEGRAM_TOKEN (BotFather): ").strip()
         if TELEGRAM_TOKEN:
             os.environ["TELEGRAM_TOKEN"] = TELEGRAM_TOKEN
-            # save to .env
-            try:
-                save_env({"TELEGRAM_TOKEN": TELEGRAM_TOKEN})
-                logger.info(".env записан с TELEGRAM_TOKEN")
-            except Exception:
-                logger.exception("Не удалось записать .env")
+            save_env({"TELEGRAM_TOKEN": TELEGRAM_TOKEN})
+            logger.info("TELEGRAM_TOKEN сохранён в .env")
         else:
             raise RuntimeError("TELEGRAM_TOKEN не введён")
     except Exception as e:
@@ -117,33 +109,24 @@ SEND_MESSAGE_URL = BOT_API + "/sendMessage"
 EDIT_MESSAGE_URL = BOT_API + "/editMessageText"
 SEND_PHOTO_URL = BOT_API + "/sendPhoto"
 ANSWER_CB_URL = BOT_API + "/answerCallbackQuery"
-DELETE_WEBHOOK_URL = BOT_API + "/deleteWebhook"
-GET_WEBHOOK_INFO_URL = BOT_API + "/getWebhookInfo"
+GET_WEBHOOK_INFO = BOT_API + "/getWebhookInfo"
 
-# other envs
-CHAT_ID_ADMIN = os.getenv("CHAT_ID_ADMIN") or ""
-PORT = int(os.getenv("PORT") or 8000)
-DB_PATH = os.getenv("DB_PATH") or "bot_data.sqlite"
+# ---------------- Other config ----------------
+PORT = int(os.getenv("PORT", "8000"))
+DB_PATH = os.getenv("DB_PATH", "bot_data.sqlite")
+PRICE_POLL_INTERVAL = int(os.getenv("PRICE_POLL_INTERVAL", "10"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "500"))
 
-# ---------------- Exchange & intervals ----------------
-exchange = ccxt.mexc({"enableRateLimit": True})
-
-INTERVALS = {
-    "1m": "1m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1d"
-}
-
+# default symbols per user initially
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "NEAR/USDT"]
 
-PRICE_POLL_INTERVAL = 10  # seconds for background polling / history saving
-HISTORY_LIMIT = 500  # in-memory cache per symbol
+# chart intervals allowed
+INTERVALS = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 
-# ---------------- DB init ----------------
+# ---------------- Exchange ----------------
+exchange = ccxt.mexc({"enableRateLimit": True})
+
+# ---------------- Database init ----------------
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
@@ -166,7 +149,7 @@ def init_db():
             chat_id TEXT,
             symbol TEXT,
             target REAL,
-            alert_type TEXT DEFAULT 'cross',  -- 'above','below','cross'
+            alert_type TEXT DEFAULT 'cross',
             is_recurring INTEGER DEFAULT 0,
             active_until TEXT DEFAULT NULL,
             time_start TEXT DEFAULT NULL,
@@ -198,17 +181,17 @@ def init_db():
 
 init_db()
 
-# ---------------- In-memory runtime ----------------
-pending_alerts = {}  # chat_id -> pending flow states
+# ---------------- In-memory runtime structures ----------------
+pending_states = {}  # chat_id -> state dict (awaiting_new_symbol, awaiting_delete, etc.)
 last_prices = {}     # symbol -> last price
-history_cache = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))  # symbol -> deque of (ts, price)
+history_cache = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))  # symbol -> deque((ts, price))
 
 # ---------------- DB wrappers ----------------
 def db_commit():
     try:
         conn.commit()
     except Exception:
-        logger.exception("DB commit error")
+        logger.exception("DB commit failed")
 
 def add_user(chat_id):
     try:
@@ -222,8 +205,17 @@ def get_user_symbols(chat_id):
         cur.execute("SELECT symbol FROM user_symbols WHERE chat_id=?", (str(chat_id),))
         rows = cur.fetchall()
         if rows:
-            return [r[0] for r in rows]
+            symbols = [r[0] for r in rows]
+            # ensure defaults exist if user has none
+            if not symbols:
+                for s in DEFAULT_SYMBOLS:
+                    add_user_symbol(chat_id, s)
+                return DEFAULT_SYMBOLS.copy()
+            return symbols
         else:
+            # initialize with defaults
+            for s in DEFAULT_SYMBOLS:
+                add_user_symbol(chat_id, s)
             return DEFAULT_SYMBOLS.copy()
     except Exception:
         logger.exception("get_user_symbols error")
@@ -238,31 +230,47 @@ def add_user_symbol(chat_id, symbol):
         logger.exception("add_user_symbol error")
         return False
 
-def list_user_alerts(chat_id):
-    cur.execute("SELECT id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end FROM alerts WHERE chat_id=? ORDER BY id DESC", (str(chat_id),))
-    return cur.fetchall()
+def delete_user_symbol(chat_id, symbol):
+    try:
+        cur.execute("DELETE FROM user_symbols WHERE chat_id=? AND symbol=?", (str(chat_id), symbol))
+        db_commit()
+        return True
+    except Exception:
+        logger.exception("delete_user_symbol error")
+        return False
 
-def delete_alert(alert_id, chat_id):
-    cur.execute("DELETE FROM alerts WHERE id=? AND chat_id=?", (int(alert_id), str(chat_id)))
-    db_commit()
+def list_user_alerts(chat_id):
+    try:
+        cur.execute("SELECT id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end FROM alerts WHERE chat_id=? ORDER BY id DESC", (str(chat_id),))
+        return cur.fetchall()
+    except Exception:
+        logger.exception("list_user_alerts error")
+        return []
 
 def save_alert_to_db(chat_id, symbol, target, alert_type='cross', is_recurring=0, active_until=None, time_start=None, time_end=None):
-    cur.execute(
-        "INSERT INTO alerts (chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (str(chat_id), symbol, float(target), alert_type, int(is_recurring), active_until, time_start, time_end)
-    )
-    db_commit()
+    try:
+        cur.execute(
+            "INSERT INTO alerts (chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(chat_id), symbol, float(target), alert_type, int(is_recurring), active_until, time_start, time_end)
+        )
+        db_commit()
+    except Exception:
+        logger.exception("save_alert_to_db error")
 
 def get_all_alerts():
-    cur.execute("SELECT id, chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end FROM alerts")
-    return cur.fetchall()
+    try:
+        cur.execute("SELECT id, chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end FROM alerts")
+        return cur.fetchall()
+    except Exception:
+        logger.exception("get_all_alerts error")
+        return []
 
 def log_db(level, message):
     try:
         cur.execute("INSERT INTO logs (level, message) VALUES (?, ?)", (level.upper(), message))
         db_commit()
     except Exception:
-        logger.exception("log_db error")
+        logger.exception("log_db insert error")
     getattr(logger, level.lower())(message)
 
 # ---------------- Telegram helpers ----------------
@@ -271,12 +279,11 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="HTML", disable_we
     if parse_mode:
         payload["parse_mode"] = parse_mode
     if reply_markup is not None:
-        # reply_markup must be JSON
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
         r = requests.post(SEND_MESSAGE_URL, data=payload, timeout=10)
         if not r.ok:
-            logger.warning("send_message failed: %s %s", r.status_code, r.text)
+            logger.warning("send_message failed %s %s", r.status_code, r.text)
         return r.json()
     except Exception:
         logger.exception("send_message exception")
@@ -289,24 +296,26 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
     try:
         r = requests.post(EDIT_MESSAGE_URL, data=payload, timeout=10)
         if not r.ok:
-            logger.warning("edit_message failed: %s %s", r.status_code, r.text)
+            logger.warning("edit_message failed %s %s", r.status_code, r.text)
         return r.json()
     except Exception:
         logger.exception("edit_message exception")
         return {}
 
 def answer_callback(callback_query_id, text=None, show_alert=False):
-    payload = {"callback_query_id": callback_query_id, "show_alert": "true" if show_alert else "false"}
+    payload = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
+    if show_alert:
+        payload["show_alert"] = "true"
     try:
         requests.post(ANSWER_CB_URL, data=payload, timeout=5)
     except Exception:
         pass
 
-def send_photo_bytes(chat_id, img_bytes, caption=None):
+def send_photo_bytes(chat_id, bytes_buf, caption=None):
     try:
-        files = {"photo": ("chart.png", img_bytes.getvalue() if hasattr(img_bytes, "getvalue") else img_bytes)}
+        files = {"photo": ("chart.png", bytes_buf.getvalue() if hasattr(bytes_buf, "getvalue") else bytes_buf)}
         data = {"chat_id": str(chat_id)}
         if caption:
             data["caption"] = caption
@@ -319,69 +328,58 @@ def send_photo_bytes(chat_id, img_bytes, caption=None):
         logger.exception("send_photo exception")
         return {}
 
-# ---------------- Keyboards ----------------
-def build_reply_main_menu():
-    # Reply keyboard (persistent)
+# ---------------- Keyboards (reply + inline) ----------------
+def reply_main_menu():
     kb = {
         "keyboard": [
             [{"text": "📈 Price"}, {"text": "⏰ Set Alert"}],
             [{"text": "📋 Status"}, {"text": "📊 Chart"}],
-            [{"text": "➕ Add Coin"}, {"text": "⚙️ Settings"}]
+            [{"text": "➕ Add Coin"}, {"text": "🗑 Delete Coin"}],
+            [{"text": "⚙️ Settings"}]
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False
     }
     return kb
 
-def build_price_symbols_inline(symbols):
+def inline_symbols_buttons(symbols, prefix):  # prefix used in callback_data e.g. price_, chart_
     rows = []
-    for s in symbols:
-        rows.append([{"text": s.split("/")[0], "callback_data": f"price_symbol|{s}"}])
+    # 2 per row
+    row = []
+    for i, s in enumerate(symbols, 1):
+        row.append({"text": s, "callback_data": f"{prefix}|{s}"})
+        if i % 2 == 0:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     rows.append([{"text": "⬅️ Back", "callback_data": "back_main"}])
     return {"inline_keyboard": rows}
 
-def build_chart_intervals_inline():
-    rows = [[{"text": "1m", "callback_data": "chart_interval|1m"},
-             {"text": "5m", "callback_data": "chart_interval|5m"},
-             {"text": "15m", "callback_data": "chart_interval|15m"}],
-            [{"text": "30m", "callback_data": "chart_interval|30m"},
-             {"text": "1h", "callback_data": "chart_interval|1h"},
-             {"text": "4h", "callback_data": "chart_interval|4h"}],
-            [{"text": "1d", "callback_data": "chart_interval|1d"},
-             {"text": "⬅️ Back", "callback_data": "back_main"}]]
+def inline_intervals_buttons(symbol):
+    rows = [
+        [{"text": "1m", "callback_data": f"chart|{symbol}|1m"},
+         {"text": "5m", "callback_data": f"chart|{symbol}|5m"},
+         {"text": "15m", "callback_data": f"chart|{symbol}|15m"}],
+        [{"text": "30m", "callback_data": f"chart|{symbol}|30m"},
+         {"text": "1h", "callback_data": f"chart|{symbol}|1h"},
+         {"text": "4h", "callback_data": f"chart|{symbol}|4h"}],
+        [{"text": "1d", "callback_data": f"chart|{symbol}|1d"},
+         {"text": "⬅️ Back", "callback_data": "back_main"}]
+    ]
     return {"inline_keyboard": rows}
 
-def build_symbols_for_interval_inline(symbols, interval):
+def inline_delete_coin_buttons(symbols):
     rows = []
     for s in symbols:
-        rows.append([{"text": s, "callback_data": f"chart_symbol|{s}|{interval}"}])
+        rows.append([{"text": s, "callback_data": f"delcoin|{s}"}])
     rows.append([{"text": "⬅️ Back", "callback_data": "back_main"}])
     return {"inline_keyboard": rows}
 
-def build_alert_type_kb():
-    return {"inline_keyboard":[
-        [{"text":"📈 Above","callback_data":"alert_type|above"},
-         {"text":"📉 Below","callback_data":"alert_type|below"},
-         {"text":"🔄 Cross","callback_data":"alert_type|cross"}]
-    ]}
-
-def build_alert_recurring_kb():
-    return {"inline_keyboard":[
-        [{"text":"☑️ One-time","callback_data":"alert_rec|0"},
-         {"text":"🔂 Recurring","callback_data":"alert_rec|1"}],
-        [{"text":"⬅️ Cancel","callback_data":"back_main"}]
-    ]}
-
-def build_my_alerts_kb(chat_id):
-    rows = []
-    rows.append([{"text":"⬅️ Back", "callback_data":"back_main"}])
-    return {"inline_keyboard": rows}
-
-# ---------------- Price polling & history ----------------
+# ---------------- Price fetching and history ----------------
 def fetch_and_save_prices_loop():
     while True:
         try:
-            # gather symbols (default + user added)
             cur.execute("SELECT DISTINCT symbol FROM user_symbols")
             rows = cur.fetchall()
             symbols = set(DEFAULT_SYMBOLS)
@@ -391,18 +389,16 @@ def fetch_and_save_prices_loop():
                 try:
                     ticker = exchange.fetch_ticker(sym)
                     price = float(ticker.get("last") or ticker.get("close") or 0.0)
-                    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                     last_prices[sym] = price
-                    # save to DB history
-                    cur.execute("INSERT INTO history (symbol, price, ts) VALUES (?, ?, ?)", (sym, price, now_ts))
+                    cur.execute("INSERT INTO history (symbol, price, ts) VALUES (?, ?, ?)", (sym, price, ts))
                     db_commit()
-                    history_cache[sym].append((now_ts, price))
+                    history_cache[sym].append((ts, price))
                 except Exception as e:
-                    logger.debug("fetch price error for %s: %s", sym, str(e))
-            # check alerts after prices updated
+                    logger.debug("fetch price error %s: %s", sym, str(e))
             check_alerts()
         except Exception:
-            logger.exception("fetch_and_save_prices loop error")
+            logger.exception("price polling error")
         time.sleep(PRICE_POLL_INTERVAL)
 
 # ---------------- Alerts checking ----------------
@@ -416,12 +412,12 @@ def check_alerts():
     try:
         alerts = get_all_alerts()
         for alert in alerts:
-            alert_id, chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end = alert
+            aid, chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end = alert
             if active_until:
                 try:
                     ru = datetime.strptime(active_until, "%Y-%m-%d %H:%M:%S")
                     if datetime.now() > ru:
-                        cur.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
+                        cur.execute("DELETE FROM alerts WHERE id=?", (aid,))
                         db_commit()
                         continue
                 except Exception:
@@ -449,23 +445,20 @@ def check_alerts():
                         triggered = True
             if triggered:
                 try:
-                    send_message(chat_id, f"🔔 Alert fired: {symbol} {alert_type} {target}$ (current {cur_price}$)")
-                    log_db("info", f"Alert fired for {chat_id} {symbol} {alert_type} {target}")
+                    send_message(chat_id, f"🔔 ALERT: {symbol} {alert_type} {target}$ — current {cur_price}$")
+                    log_db("info", f"Alert fired {chat_id} {symbol} {alert_type} {target}")
                 except Exception:
-                    logger.exception("sending alert message failed")
+                    logger.exception("alert send failed")
                 if not is_recurring:
-                    cur.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
+                    cur.execute("DELETE FROM alerts WHERE id=?", (aid,))
                     db_commit()
     except Exception:
         logger.exception("check_alerts error")
 
-# ---------------- Chart building ----------------
+# ---------------- Charts ----------------
 def fetch_ohlcv_df(symbol, timeframe, limit=200):
-    """
-    Fetch OHLCV from ccxt and return pandas DataFrame with timestamp (datetime) and open/high/low/close/volume
-    """
     if not HAS_CHARTS:
-        raise RuntimeError("pandas/matplotlib not available")
+        raise RuntimeError("Charts disabled (pandas/matplotlib missing)")
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -473,39 +466,30 @@ def fetch_ohlcv_df(symbol, timeframe, limit=200):
         df.set_index("timestamp", inplace=True)
         return df
     except Exception:
-        logger.exception("fetch_ohlcv_df error for %s %s", symbol, timeframe)
+        logger.exception("fetch_ohlcv_df error %s %s", symbol, timeframe)
         return pd.DataFrame()
 
-def plot_candles(df, symbol, timeframe):
-    """
-    Plot candlestick chart and return BytesIO
-    """
+def plot_candles_image(df, symbol, timeframe):
     if not HAS_CHARTS:
-        raise RuntimeError("pandas/matplotlib not available")
+        return None
     try:
-        import matplotlib.ticker as ticker
         fig, ax = plt.subplots(figsize=(10,5))
-        # width in days for rectangles depending on timeframe
-        widths = {
-            "1m": 0.0006, "5m": 0.003, "15m": 0.009, "30m": 0.02, "1h": 0.04, "4h": 0.16, "1d": 0.8
-        }
+        widths = {"1m": 0.0006, "5m": 0.003, "15m": 0.009, "30m": 0.02, "1h": 0.04, "4h": 0.16, "1d": 0.8}
         width = widths.get(timeframe, 0.02)
         times = mdates.date2num(df.index.to_pydatetime())
-        for idx in range(len(df)):
-            o = df["open"].iat[idx]
-            c = df["close"].iat[idx]
-            h = df["high"].iat[idx]
-            l = df["low"].iat[idx]
-            t = times[idx]
+        for i in range(len(df)):
+            o = df["open"].iat[i]
+            c = df["close"].iat[i]
+            h = df["high"].iat[i]
+            l = df["low"].iat[i]
+            t = times[i]
             color = "green" if c >= o else "red"
-            # wick
             ax.plot([t, t], [l, h], color=color, linewidth=0.8)
-            # body
             rect_bottom = min(o, c)
-            rect_height = abs(c - o)
-            ax.add_patch(plt.Rectangle((t - width/2, rect_bottom), width, rect_height, color=color, alpha=0.8))
+            rect_height = max(abs(c - o), 1e-8)
+            ax.add_patch(plt.Rectangle((t - width/2, rect_bottom), width, rect_height, color=color, alpha=0.9))
         ax.xaxis_date()
-        ax.set_title(f"{symbol} / {timeframe}")
+        ax.set_title(f"{symbol} — {timeframe}")
         ax.set_ylabel("Price (USDT)")
         ax.grid(True, linewidth=0.3, linestyle="--", alpha=0.5)
         fig.autofmt_xdate()
@@ -516,222 +500,233 @@ def plot_candles(df, symbol, timeframe):
         buf.seek(0)
         return buf
     except Exception:
-        logger.exception("plot_candles error")
+        logger.exception("plot_candles_image error")
         return None
 
-# ---------------- Webhook / Bot logic (Flask) ----------------
+# ---------------- Flask webhook & handlers ----------------
 app = Flask(__name__)
 
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
-def telegram_webhook():
+def webhook():
     try:
-        data = request.json or {}
-        # log raw update for debugging
-        logger.debug("Incoming update: %s", json.dumps(data)[:2000])
-        # Callback query handling
-        if "callback_query" in data:
-            cb = data["callback_query"]
-            cb_id = cb.get("id")
-            from_user = cb.get("from", {})
-            user_id = from_user.get("id")
-            chat = cb.get("message", {}).get("chat", {})
-            chat_id = chat.get("id") or user_id
-            action = cb.get("data", "")
-            add_user(chat_id)
-            log_db("info", f"callback {action} from {chat_id}")
-
-            # navigation
-            if action == "back_main":
-                send_message(chat_id, "Main menu:", reply_markup=build_reply_main_menu())
-                answer_callback(cb_id)
-                return {"ok": True}
-
-            # Price symbol button
-            if action.startswith("price_symbol|"):
-                symbol = action.split("|", 1)[1]
-                try:
-                    ticker = exchange.fetch_ticker(symbol)
-                    price = float(ticker.get("last") or ticker.get("close") or 0.0)
-                    send_message(chat_id, f"💰 {symbol}: {price}$", reply_markup=build_reply_main_menu())
-                except Exception:
-                    send_message(chat_id, f"Ошибка при получении цены для {symbol}", reply_markup=build_reply_main_menu())
-                answer_callback(cb_id)
-                return {"ok": True}
-
-            # Chart interval selection
-            if action.startswith("chart_interval|"):
-                interval = action.split("|", 1)[1]
-                symbols = get_user_symbols(chat_id)
-                send_message(chat_id, f"Choose symbol for interval {interval}:", reply_markup=build_symbols_for_interval_inline(symbols, interval))
-                answer_callback(cb_id)
-                return {"ok": True}
-
-            # Chart symbol selection with interval
-            if action.startswith("chart_symbol|"):
-                parts = action.split("|")
-                if len(parts) >= 3:
-                    symbol = parts[1]
-                    interval = parts[2]
-                    # fetch and plot
-                    try:
-                        if not HAS_CHARTS:
-                            send_message(chat_id, "Charts not available (missing pandas/matplotlib).", reply_markup=build_reply_main_menu())
-                            answer_callback(cb_id)
-                            return {"ok": True}
-                        df = fetch_ohlcv_df(symbol, interval, limit=200)
-                        if df.empty:
-                            send_message(chat_id, f"Недостаточно данных для {symbol} {interval}", reply_markup=build_reply_main_menu())
-                        else:
-                            img = plot_candles(df, symbol, interval)
-                            if img:
-                                send_photo_bytes(chat_id, img, caption=f"{symbol} — {interval}")
-                            else:
-                                send_message(chat_id, "Ошибка построения графика", reply_markup=build_reply_main_menu())
-                    except Exception:
-                        logger.exception("chart error")
-                        send_message(chat_id, "Ошибка при получении графика", reply_markup=build_reply_main_menu())
-                answer_callback(cb_id)
-                return {"ok": True}
-
-            # add symbol confirm from inline (if flow uses)
-            if action.startswith("add_symbol_confirm|"):
-                sym = action.split("|",1)[1]
-                ok = add_user_symbol(chat_id, sym)
-                if ok:
-                    send_message(chat_id, f"✅ {sym} added to your list.", reply_markup=build_reply_main_menu())
-                else:
-                    send_message(chat_id, f"❌ Can't add {sym}.", reply_markup=build_reply_main_menu())
-                answer_callback(cb_id)
-                return {"ok": True}
-
-            # alert flows: types/recurring/time etc (skeleton - reuses pending_alerts)
-            if action.startswith("alert_type|"):
-                typ = action.split("|",1)[1]
-                key = str(chat_id)
-                if key in pending_alerts:
-                    pending_alerts[key]["type_selected"] = typ
-                    send_message(chat_id, "Choose recurring or one-time:", reply_markup=build_alert_recurring_kb())
-                answer_callback(cb_id)
-                return {"ok": True}
-
-            if action.startswith("alert_rec|"):
-                val = action.split("|",1)[1]
-                key = str(chat_id)
-                if key in pending_alerts:
-                    pending_alerts[key]["recurring"] = int(val)
-                    # finalize: save to DB
-                    a = pending_alerts[key]
-                    save_alert_to_db(chat_id, f"{a['coin']}/USDT", a['price'], a.get("type_selected","cross"), a.get("recurring",0), a.get("active_until"))
-                    send_message(chat_id, f"✅ Alert added: {a['coin']}/USDT {a.get('type_selected','cross')} {a['price']}$", reply_markup=build_reply_main_menu())
-                    del pending_alerts[key]
-                answer_callback(cb_id)
-                return {"ok": True}
-
-            # unknown callback
-            answer_callback(cb_id, "Unknown action")
+        update = request.json or {}
+        logger.debug("incoming update: %s", json.dumps(update)[:2000])
+        # callback queries
+        if "callback_query" in update:
+            handle_callback(update["callback_query"])
             return {"ok": True}
-
-        # Message handling
-        msg = data.get("message") or data.get("edited_message")
+        # messages
+        msg = update.get("message") or update.get("edited_message")
         if not msg:
             return {"ok": True}
-        chat_id = msg.get("chat",{}).get("id")
+        handle_message(msg)
+        return {"ok": True}
+    except Exception:
+        logger.exception("webhook exception")
+        return {"ok": True}
+
+def handle_message(msg):
+    try:
+        chat_id = msg.get("chat", {}).get("id")
         text = (msg.get("text") or "").strip()
+        if not chat_id:
+            return
         add_user(chat_id)
         log_db("info", f"msg from {chat_id}: {text}")
 
-        # handle buttons from reply keyboard and text commands
+        # if user in pending state (awaiting add/delete)
+        state = pending_states.get(str(chat_id), {})
+
+        if state.get("awaiting_new_symbol"):
+            sym = text.upper().strip()
+            if "/" not in sym:
+                sym = f"{sym}/USDT"
+            try:
+                markets = exchange.load_markets()
+                if sym in markets:
+                    ok = add_user_symbol(chat_id, sym)
+                    if ok:
+                        send_message(chat_id, f"✅ {sym} added to your list.", reply_markup=reply_main_menu())
+                    else:
+                        send_message(chat_id, f"❌ Can't add {sym}.", reply_markup=reply_main_menu())
+                else:
+                    send_message(chat_id, f"❌ Pair {sym} not found on MEXC.", reply_markup=reply_main_menu())
+            except Exception:
+                logger.exception("error checking symbol")
+                send_message(chat_id, "Ошибка при проверке символа.", reply_markup=reply_main_menu())
+            pending_states.pop(str(chat_id), None)
+            return
+
+        if state.get("awaiting_delete_choice"):
+            # user typed symbol to delete
+            sym = text.upper().strip()
+            if "/" not in sym:
+                sym = f"{sym}/USDT"
+            ok = delete_user_symbol(chat_id, sym)
+            if ok:
+                send_message(chat_id, f"✅ {sym} removed from your list.", reply_markup=reply_main_menu())
+            else:
+                send_message(chat_id, f"❌ {sym} not found in your list.", reply_markup=reply_main_menu())
+            pending_states.pop(str(chat_id), None)
+            return
+
+        # standard commands / reply keyboard
         if text.lower().startswith("/start") or text == "Menu" or text == "Главное":
-            send_message(chat_id, "Welcome! Choose action:", reply_markup=build_reply_main_menu())
-            return {"ok": True}
+            send_message(chat_id, "Привет! Выбери действие:", reply_markup=reply_main_menu())
+            return
 
         if text == "📈 Price" or text.startswith("/price"):
-            # show price menu as inline buttons
             symbols = get_user_symbols(chat_id)
-            send_message(chat_id, "Select symbol:", reply_markup=build_price_symbols_inline(symbols))
-            return {"ok": True}
+            send_message(chat_id, "Выберите монету:", reply_markup=inline_symbols_buttons(symbols, "price"))
+            return
+
+        if text == "📊 Chart" or text.startswith("/chart"):
+            symbols = get_user_symbols(chat_id)
+            send_message(chat_id, "Выберите монету для графика:", reply_markup=inline_symbols_buttons(symbols, "chart"))
+            return
+
+        if text == "➕ Add Coin":
+            pending_states[str(chat_id)] = {"awaiting_new_symbol": True}
+            send_message(chat_id, "Введите символ монеты (например: ADA или ADA/USDT):")
+            return
+
+        if text == "🗑 Delete Coin":
+            syms = get_user_symbols(chat_id)
+            send_message(chat_id, "Выберите монету для удаления:", reply_markup=inline_delete_coin_buttons(syms))
+            # or allow typed deletion
+            pending_states[str(chat_id)] = {"awaiting_delete_choice": True}
+            return
 
         if text == "📋 Status" or text.startswith("/status"):
             rows = list_user_alerts(chat_id)
             if not rows:
-                send_message(chat_id, "You have no alerts.", reply_markup=build_reply_main_menu())
+                send_message(chat_id, "У вас пока нет Alerts.", reply_markup=reply_main_menu())
             else:
                 lines = []
                 for r in rows:
                     aid, sym, targ, atype, rec, a_until, ts, te = r
                     lines.append(f"{aid}: {sym} {atype} {targ}$ {'🔂' if rec else '☑️'}")
-                send_message(chat_id, "\n".join(lines), reply_markup=build_reply_main_menu())
-            return {"ok": True}
-
-        if text == "⏰ Set Alert" or text.startswith("/set"):
-            # start add alert flow: choose coin
-            symbols = get_user_symbols(chat_id)
-            rows = []
-            for s in symbols:
-                rows.append([{"text": s.split("/")[0], "callback_data": f"set_alert_{s.split('/')[0]}"}])
-            rows.append([{"text":"⬅️ Back", "callback_data":"back_main"}])
-            kb = {"inline_keyboard": rows}
-            send_message(chat_id, "Choose coin to set alert:", reply_markup=kb)
-            return {"ok": True}
-
-        if text == "➕ Add Coin":
-            send_message(chat_id, "Send coin symbol (e.g. ADA or ADA/USDT):", reply_markup=None)
-            # mark awaiting new coin
-            pending_alerts[str(chat_id)] = {"awaiting_new_symbol": True}
-            return {"ok": True}
-
-        if text == "📊 Chart" or text.startswith("/chart"):
-            send_message(chat_id, "Choose interval:", reply_markup=build_chart_intervals_inline())
-            return {"ok": True}
-
-        if text == "⚙️ Settings":
-            send_message(chat_id, "Settings:\n- Signals auto on/off coming soon", reply_markup=build_reply_main_menu())
-            return {"ok": True}
-
-        # If awaiting adding a new symbol
-        key = str(chat_id)
-        if key in pending_alerts and pending_alerts[key].get("awaiting_new_symbol"):
-            symbol = text.upper().strip()
-            if "/" not in symbol:
-                symbol = f"{symbol}/USDT"
-            try:
-                markets = exchange.load_markets()
-                if symbol in markets:
-                    add_user_symbol(chat_id, symbol)
-                    send_message(chat_id, f"✅ Coin {symbol} added to your list.", reply_markup=build_reply_main_menu())
-                else:
-                    send_message(chat_id, f"❌ Pair {symbol} not found on MEXC.", reply_markup=build_reply_main_menu())
-            except Exception:
-                send_message(chat_id, f"Error checking {symbol}.", reply_markup=build_reply_main_menu())
-            del pending_alerts[key]
-            return {"ok": True}
+                send_message(chat_id, "\n".join(lines), reply_markup=reply_main_menu())
+            return
 
         # fallback
-        send_message(chat_id, "Choose action from menu:", reply_markup=build_reply_main_menu())
-        return {"ok": True}
+        send_message(chat_id, "Команда не распознана. Используй меню.", reply_markup=reply_main_menu())
 
     except Exception:
-        logger.exception("telegram_webhook exception")
-        return {"ok": True}
+        logger.exception("handle_message error")
 
-# ---------------- Start background threads ----------------
-def start_background_workers():
+def handle_callback(cb):
+    try:
+        cb_id = cb.get("id")
+        from_user = cb.get("from", {})
+        user_id = from_user.get("id")
+        chat = cb.get("message", {}).get("chat", {})
+        chat_id = chat.get("id") or user_id
+        data = cb.get("data", "")
+        add_user(chat_id)
+        log_db("info", f"callback {data} from {chat_id}")
+
+        # navigation
+        if data == "back_main":
+            send_message(chat_id, "Меню:", reply_markup=reply_main_menu())
+            answer_callback(cb_id)
+            return
+
+        # price flow: callback price|SYMBOL
+        if data.startswith("price|"):
+            _, sym = data.split("|", 1)
+            try:
+                ticker = exchange.fetch_ticker(sym)
+                price = float(ticker.get("last") or ticker.get("close") or 0.0)
+                send_message(chat_id, f"💰 {sym}: {price}$", reply_markup=reply_main_menu())
+            except Exception:
+                logger.exception("price fetch error")
+                send_message(chat_id, f"Ошибка получения цены для {sym}", reply_markup=reply_main_menu())
+            answer_callback(cb_id)
+            return
+
+        # chart flow: first callback "chart|SYMBOL" -> show intervals, then "chart_send|SYMBOL|INTERVAL"
+        if data.startswith("chart|"):
+            _, sym = data.split("|", 1)
+            # show intervals inline
+            send_message(chat_id, f"Выберите интервал для {sym}:", reply_markup=inline_intervals_buttons(sym))
+            answer_callback(cb_id)
+            return
+
+        if data.startswith("chart|") is False and data.count("|") == 2 and data.split("|")[0] == "chart_send":
+            # fallback not used, but keep for compatibility
+            pass
+
+        # handle chart (callback exactly like chart|SYMBOL|INTERVAL when user presses interval buttons)
+        if data.startswith("chart|") and data.count("|") == 2:
+            _, sym, interval = data.split("|")
+            # validate interval
+            if interval not in INTERVALS:
+                send_message(chat_id, "Неподдерживаемый интервал.", reply_markup=reply_main_menu())
+                answer_callback(cb_id)
+                return
+            # build and send chart
+            try:
+                if not HAS_CHARTS:
+                    send_message(chat_id, "Charts unavailable (missing pandas/matplotlib).", reply_markup=reply_main_menu())
+                    answer_callback(cb_id)
+                    return
+                df = fetch_ohlcv_df(sym, interval, limit=200)
+                if df.empty:
+                    send_message(chat_id, f"Недостаточно данных для {sym} {interval}", reply_markup=reply_main_menu())
+                else:
+                    img = plot_candles_image(df, sym, interval)
+                    if img:
+                        send_photo_bytes(chat_id, img, caption=f"{sym} — {interval}")
+                    else:
+                        send_message(chat_id, "Ошибка построения графика.", reply_markup=reply_main_menu())
+            except Exception:
+                logger.exception("chart handling error")
+                send_message(chat_id, "Ошибка при построении графика.", reply_markup=reply_main_menu())
+            answer_callback(cb_id)
+            return
+
+        # add coin confirm (for inline flows) - not used but keep for future
+        if data.startswith("addcoin|"):
+            _, sym = data.split("|", 1)
+            ok = add_user_symbol(chat_id, sym)
+            if ok:
+                send_message(chat_id, f"✅ {sym} added.", reply_markup=reply_main_menu())
+            else:
+                send_message(chat_id, f"❌ Can't add {sym}.", reply_markup=reply_main_menu())
+            answer_callback(cb_id)
+            return
+
+        # delete coin via inline button
+        if data.startswith("delcoin|"):
+            _, sym = data.split("|", 1)
+            ok = delete_user_symbol(chat_id, sym)
+            if ok:
+                send_message(chat_id, f"✅ {sym} removed from your list.", reply_markup=reply_main_menu())
+            else:
+                send_message(chat_id, f"❌ {sym} not in your list.", reply_markup=reply_main_menu())
+            answer_callback(cb_id)
+            return
+
+        # unknown callback
+        answer_callback(cb_id, "Неизвестная кнопка.")
+    except Exception:
+        logger.exception("handle_callback error")
+
+# ---------------- Start background workers & run ----------------
+def start_workers():
     try:
         t = threading.Thread(target=fetch_and_save_prices_loop, daemon=True)
         t.start()
         logger.info("Started price polling thread.")
     except Exception:
-        logger.exception("start_background_workers error")
+        logger.exception("start_workers error")
 
-# ---------------- Run Flask (main) ----------------
 if __name__ == "__main__":
-    # start background workers
-    start_background_workers()
-
-    logger.info("Starting Flask webhook on port %s", PORT)
-
-    # If running locally for dev you may want to set debug True; for Railway use gunicorn in Procfile.
+    start_workers()
+    logger.info("Starting Flask on port %s", PORT)
     try:
+        # When running on Railway use gunicorn; for local dev flask.run is ok
         app.run(host="0.0.0.0", port=PORT)
     except Exception:
         logger.exception("Flask run error")
