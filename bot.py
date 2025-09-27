@@ -2,16 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 bot.py — Telegram crypto bot (single-file)
-Features:
- - Webhook (Flask)
- - MEXC via ccxt (Last Price via ccxt; Fair Price via MEXC API if available)
- - SQLite persistence (users, user_symbols, alerts, autosignals, history, logs)
- - Inline-button UIs (add alert, manage alerts, set price via buttons, chart selection)
- - Alerts: percent/$, one-shot or recurring
- - Autosignals: subscribe per coin+timeframe, background RSI/EMA-based signals (repeating)
- - Candlestick charts via mplfinance / matplotlib (if installed)
- - Logging to stdout and DB
- - TELEGRAM_TOKEN from ENV or token.txt (interactive prompt if local)
+Improvements requested:
+ - Bulk/faster price fetching from MEXC (fetch_tickers)
+ - Fair price attempt (MEXC endpoints) and fallback to last price
+ - Matplotlib backend set to 'Agg' for headless servers (Railway)
+ - Fix alert save errors and ensure DB commits are safe
+ - Candlestick chart generation robust with fallbacks
+ - Autosignals run continuously (RSI/EMA) and do not rely on chart generation
+ - All interactions via inline buttons (main menu always available)
+ - TELEGRAM_TOKEN resolution from ENV or token.txt (non-blocking for Railway)
+ - Extensive logging (Railway logs friendly) and DB logging
+ - Graceful error handling: exceptions are logged and don't crash bot
+ - Uses ccxt.mexc for exchange connectivity
 """
 
 import os
@@ -22,55 +24,56 @@ import math
 import logging
 import sqlite3
 import threading
+import traceback
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 
-# Optional libs for charts and indicators
-HAS_PANDAS = True
-HAS_MATPLOTLIB = True
-HAS_MPLFINANCE = True
+# ---- Matplotlib safe backend for headless envs (Railway/Gunicorn) ----
 try:
-    import pandas as pd
-    import numpy as np
-except Exception:
-    HAS_PANDAS = False
-
-try:
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
+    HAS_MATPLOTLIB = True
 except Exception:
     HAS_MATPLOTLIB = False
 
+# ---- Optional libs for indicators and charting ----
+try:
+    import pandas as pd
+    import numpy as np
+    HAS_PANDAS = True
+except Exception:
+    HAS_PANDAS = False
+
+# mplfinance optional for candlesticks
 try:
     import mplfinance as mpf
+    HAS_MPLFINANCE = True
 except Exception:
     HAS_MPLFINANCE = False
 
-# Core libs
+# ---- Core network libs ----
 try:
     import requests
     import ccxt
     from flask import Flask, request
 except Exception as e:
-    print("ERROR: missing required packages. Install required packages (ccxt, flask, requests).")
+    print("ERROR: missing required packages. Install ccxt, flask, requests. Details:", e)
     raise
 
-# ---------------- Logging ----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+# ---- Logging config ----
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("crypto_bot")
 
-# ---------------- Token resolution & persistence ----------------
+# ---------------- TELEGRAM TOKEN RESOLUTION ----------------
 def resolve_token():
     """
     Resolve TELEGRAM_TOKEN in order:
       1) ENV TELEGRAM_TOKEN
       2) token.txt (if exists)
-      3) if interactive --> prompt user and save token.txt
-      4) else -> exit with error (useful for Railway/Gunicorn)
+      3) interactive prompt (only if tty) and save to token.txt
+      4) else raise RuntimeError (expected for Railway/Gunicorn if env missing)
     """
     token = os.getenv("TELEGRAM_TOKEN")
     if token:
@@ -88,7 +91,7 @@ def resolve_token():
         except Exception:
             logger.exception("Failed to read token.txt")
 
-    # If interactive, prompt
+    # Interactive prompt only if running in TTY
     try:
         if sys.stdin and sys.stdin.isatty():
             token = input("Введите TELEGRAM_TOKEN (BotFather): ").strip()
@@ -103,15 +106,15 @@ def resolve_token():
     except Exception:
         logger.exception("Prompt for token failed")
 
-    # Non-interactive or no token -> exit with instruction
-    logger.error("TELEGRAM_TOKEN not found. Please set TELEGRAM_TOKEN in environment (Railway: Project > Variables).")
+    logger.error("TELEGRAM_TOKEN not found. Set TELEGRAM_TOKEN env var (Railway: Project > Variables) or create token.txt.")
     raise RuntimeError("TELEGRAM_TOKEN not set")
 
 try:
     TELEGRAM_TOKEN = resolve_token()
 except Exception as e:
     logger.exception("Token resolution failed: %s", e)
-    sys.exit(1)
+    # In non-interactive env we must stop; raising so caller sees it.
+    raise
 
 BOT_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 SEND_MESSAGE = BOT_API + "/sendMessage"
@@ -124,67 +127,16 @@ PORT = int(os.getenv("PORT", "8000"))
 DB_PATH = os.getenv("DB_PATH", "bot_data.sqlite")
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "NEAR/USDT"]
 PRICE_POLL_INTERVAL = int(os.getenv("PRICE_POLL_INTERVAL", "10"))  # seconds
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "1000"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "1000"))  # how many price points to keep
+AUTOSIGNAL_MIN_INTERVAL = int(os.getenv("AUTOSIGNAL_MIN_INTERVAL", "900"))  # secs between autosignal notifications per sub
 
 PRICE_STEPS = [-10000, -5000, -1000, -100, -10, -1, 1, 10, 100, 1000, 5000, 10000]
 TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 
-# ---------------- Exchange ----------------
-exchange = ccxt.mexc({"enableRateLimit": True})
+# ---------------- Exchange (MEXC) ----------------
+exchange = ccxt.mexc({"enableRateLimit": True, "timeout": 10000})
 
-# Utility: get fair price from MEXC contract API if available
-def fetch_mexc_fair_price(symbol_pair):
-    """
-    Try to fetch fair price (mark price) from MEXC public endpoints.
-    symbol_pair: "BTC/USDT"
-    Returns float or None.
-    """
-    # Some MEXC endpoints use symbol without slash and with pair like BTC_USDT or BTCUSDT.
-    # Try a few possible endpoints; if fails, return None.
-    try:
-        s = symbol_pair.replace("/", "").upper()  # e.g. BTCUSDT
-        # MEXC has a contract API for futures; there might be endpoints like:
-        # https://contract.mexc.com/api/v1/contract/fair_price/{symbol}
-        # or public/contract/markPrice?symbol=
-        # We'll attempt the fair_price endpoint first.
-        urls = [
-            f"https://contract.mexc.com/api/v1/contract/fair_price/{s}",
-            f"https://contract.mexc.com/api/v1/contract/premiumIndex?symbol={s}",
-            f"https://www.mexc.com/open/api/v2/market/ticker?symbol={s}"
-        ]
-        for url in urls:
-            try:
-                r = requests.get(url, timeout=5)
-                if r.status_code != 200:
-                    continue
-                j = r.json()
-                # Try to parse known responses
-                if isinstance(j, dict):
-                    # contract fair_price typical response: {"success": True, "data": {"fairPrice": "xxx"}}
-                    if "data" in j:
-                        data = j["data"]
-                        if isinstance(data, dict) and "fairPrice" in data:
-                            return float(data["fairPrice"])
-                        # premiumIndex response: data may contain 'markPrice' or 'lastPrice'
-                        if isinstance(data, dict) and ("markPrice" in data or "mark_price" in data):
-                            return float(data.get("markPrice") or data.get("mark_price"))
-                        # some tow responses: [{"symbol":.., "lastPrice":..}]
-                    # other response possibilities
-                    if "ticker" in j and isinstance(j["ticker"], dict) and "last" in j["ticker"]:
-                        return float(j["ticker"]["last"])
-                    # open API ticker
-                    if "data" in j and isinstance(j["data"], list) and len(j["data"])>0:
-                        first = j["data"][0]
-                        if isinstance(first, dict) and "last" in first:
-                            return float(first["last"])
-                # fallback try to parse numeric in body
-            except Exception:
-                continue
-    except Exception:
-        logger.exception("fetch_mexc_fair_price failed for %s", symbol_pair)
-    return None
-
-# ---------------- Database initialization ----------------
+# ---------------- Database init ----------------
 def init_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     cur = conn.cursor()
@@ -261,12 +213,133 @@ def log_db(level, message):
         logger.exception("log_db write failed")
     getattr(logger, level.lower())(message)
 
-# ---------------- In-memory runtime structures ----------------
-pending_alerts = {}  # chat_id -> dict for flows (add/edit)
-last_prices = {}     # symbol -> last
-history_cache = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
+# ---------------- In-memory runtime ----------------
+pending_alerts = {}  # temporary flows keyed by chat_id (string)
+last_prices = {}     # symbol -> last price
+history_cache = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))  # symbol -> deque of (ts, price)
 
-# ---------------- DB helper functions ----------------
+# ---------------- Helper: price fetching (fast) ----------------
+def fetch_tickers_bulk(symbols):
+    """
+    Fetch tickers in bulk using ccxt.fetch_tickers if supported.
+    Returns dict symbol->last_price (float or None).
+    """
+    prices = {}
+    try:
+        # ccxt expects list of market symbols; ensure they exist in exchange markets
+        # fetch_tickers can accept list or no args (all tickers) depending on exchange impl
+        tickers = {}
+        try:
+            tickers = exchange.fetch_tickers(symbols)
+        except Exception:
+            # fallback: fetch tickers without argument and filter
+            all_t = exchange.fetch_tickers()
+            tickers = {k: v for k, v in all_t.items() if k in symbols}
+        for s in symbols:
+            t = tickers.get(s)
+            if t:
+                last = t.get("last") or t.get("close")
+                try:
+                    prices[s] = float(last) if last is not None else None
+                except Exception:
+                    prices[s] = None
+            else:
+                prices[s] = None
+    except Exception:
+        logger.exception("fetch_tickers_bulk error")
+        # Try per-symbol fallback
+        for s in symbols:
+            try:
+                t = exchange.fetch_ticker(s)
+                prices[s] = float(t.get("last") or t.get("close") or 0.0)
+            except Exception:
+                prices[s] = None
+    return prices
+
+def fetch_price_for(symbol):
+    """
+    Fetch price for single symbol and record history/cache.
+    """
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        price = float(ticker.get("last") or ticker.get("close") or 0.0)
+        now_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        last_prices[symbol] = price
+        try:
+            with db_lock:
+                cur.execute("INSERT INTO history (symbol, price, ts) VALUES (?, ?, ?)", (symbol, price, now_ts))
+                conn.commit()
+        except Exception:
+            logger.exception("history save failed")
+        history_cache[symbol].append((now_ts, price))
+        return price
+    except Exception:
+        logger.exception("fetch_price_for failed for %s", symbol)
+        return None
+
+def fetch_all_user_symbols():
+    try:
+        with db_lock:
+            cur.execute("SELECT DISTINCT symbol FROM user_symbols")
+            rows = cur.fetchall()
+            syms = set(DEFAULT_SYMBOLS)
+            syms.update([r[0] for r in rows])
+            return list(syms)
+    except Exception:
+        logger.exception("fetch_all_user_symbols error")
+        return DEFAULT_SYMBOLS.copy()
+
+# ---------------- Helper: MEXC Fair Price (best-effort) ----------------
+def fetch_mexc_fair_price(symbol_pair):
+    """
+    Try to fetch 'fair' or 'mark' price from MEXC using public endpoints.
+    Best-effort — may return None if endpoint isn't available.
+    """
+    try:
+        # Normalize symbol: BTC/USDT -> BTCUSDT
+        s = symbol_pair.replace("/", "").upper()
+        # Candidate endpoints:
+        candidates = [
+            f"https://contract.mexc.com/api/v1/contract/fair_price/{s}",
+            f"https://contract.mexc.com/api/v1/contract/premiumIndex?symbol={s}",
+            f"https://contract.mexc.com/api/v1/contract/market/depth?symbol={s}",  # less likely
+            f"https://www.mexc.com/open/api/v2/market/ticker?symbol={s}"  # generic
+        ]
+        for url in candidates:
+            try:
+                r = requests.get(url, timeout=5)
+                if r.status_code != 200:
+                    continue
+                j = r.json()
+                # common patterns
+                if isinstance(j, dict):
+                    data = j.get("data")
+                    if isinstance(data, dict):
+                        # fairPrice
+                        if "fairPrice" in data:
+                            return float(data["fairPrice"])
+                        if "markPrice" in data:
+                            return float(data["markPrice"])
+                        if "lastPrice" in data:
+                            return float(data["lastPrice"])
+                    # list data
+                    if isinstance(data, list) and len(data) > 0:
+                        item = data[0]
+                        for key in ("fairPrice", "last", "lastPrice", "price"):
+                            if key in item:
+                                return float(item[key])
+                    # some endpoints return ticker inside 'ticker' key
+                    if "ticker" in j and isinstance(j["ticker"], dict) and "last" in j["ticker"]:
+                        return float(j["ticker"]["last"])
+                    # fallback for simple {code:0, data:{...}} patterns
+                # else ignore
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("fetch_mexc_fair_price top-level exception")
+    return None
+
+# ---------------- DB helpers ----------------
 def add_user(chat_id):
     try:
         with db_lock:
@@ -297,12 +370,22 @@ def add_user_symbol(chat_id, symbol):
         return False
 
 def save_alert(chat_id, symbol, is_percent, value, is_recurring=0):
+    """
+    Save alert ensuring float conversion and commit; returns inserted id or None.
+    """
+    try:
+        val = float(value)
+    except Exception:
+        logger.error("save_alert invalid value: %s", value)
+        return None
     try:
         with db_lock:
-            cur.execute("INSERT INTO alerts (chat_id, symbol, is_percent, value, is_recurring) VALUES (?, ?, ?, ?, ?)",
-                        (str(chat_id), symbol, int(is_percent), float(value), int(is_recurring)))
+            cur.execute("INSERT INTO alerts (chat_id, symbol, is_percent, value, is_recurring, active) VALUES (?, ?, ?, ?, ?, ?)",
+                        (str(chat_id), symbol, int(is_percent), val, int(is_recurring), 1))
             conn.commit()
-            return cur.lastrowid
+            aid = cur.lastrowid
+            logger.info("Saved alert id=%s for %s %s", aid, chat_id, symbol)
+            return aid
     except Exception:
         logger.exception("save_alert error")
         return None
@@ -400,7 +483,11 @@ def answer_callback(callback_query_id, text=None):
 
 def send_photo_bytes(chat_id, buf, caption=None):
     try:
-        files = {"photo": ("chart.png", buf.getvalue() if hasattr(buf, "getvalue") else buf)}
+        # buf: io.BytesIO or bytes
+        if hasattr(buf, "getvalue"):
+            files = {"photo": ("chart.png", buf.getvalue())}
+        else:
+            files = {"photo": ("chart.png", buf)}
         data = {"chat_id": str(chat_id)}
         if caption:
             data["caption"] = caption
@@ -507,39 +594,12 @@ def kb_autosignals_list(rows_data):
     kb["inline_keyboard"].append([{"text":"⬅️ Назад","callback_data":"autosignals_menu"}, {"text":"🏠 Главное меню","callback_data":"main"}])
     return kb
 
-# ---------------- Price fetching & history ----------------
-def fetch_price_for(symbol):
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-        price = float(ticker.get("last") or ticker.get("close") or 0.0)
-        now_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        last_prices[symbol] = price
-        try:
-            with db_lock:
-                cur.execute("INSERT INTO history (symbol, price, ts) VALUES (?, ?, ?)", (symbol, price, now_ts))
-                conn.commit()
-        except Exception:
-            logger.exception("history save failed")
-        history_cache[symbol].append((now_ts, price))
-        return price
-    except Exception:
-        logger.exception("fetch_price_for failed for %s", symbol)
-        return None
-
-def fetch_all_user_symbols():
-    try:
-        with db_lock:
-            cur.execute("SELECT DISTINCT symbol FROM user_symbols")
-            rows = cur.fetchall()
-            syms = set(DEFAULT_SYMBOLS)
-            syms.update([r[0] for r in rows])
-            return list(syms)
-    except Exception:
-        logger.exception("fetch_all_user_symbols error")
-        return DEFAULT_SYMBOLS.copy()
-
-# ---------------- Alerts checking ----------------
+# ---------------- Alerts & Autosignals logic ----------------
 def check_alerts():
+    """
+    Evaluate active alerts against last_prices/history_cache.
+    alerts may be percent-based (relative to previous price) or absolute (value crossing).
+    """
     try:
         with db_lock:
             cur.execute("SELECT id, chat_id, symbol, is_percent, value, is_recurring, active FROM alerts WHERE active=1")
@@ -547,35 +607,41 @@ def check_alerts():
     except Exception:
         logger.exception("check_alerts db read failed")
         rows = []
+
     for r in rows:
         aid, chat_id, symbol, is_pct, value, is_rec, active = r
         cur_price = last_prices.get(symbol)
         if cur_price is None:
             continue
         triggered = False
-        # Get previous price if available
         hist = list(history_cache.get(symbol, []))
         prev_price = hist[-2][1] if len(hist) >= 2 else None
 
         if is_pct:
-            # percent change relative to previous price
+            # percent change from previous candle/point
             if prev_price:
-                change_pct = (cur_price - prev_price) / prev_price * 100 if prev_price != 0 else 0
-                if abs(change_pct) >= abs(value):
-                    triggered = True
+                try:
+                    change_pct = (cur_price - prev_price) / prev_price * 100 if prev_price != 0 else 0
+                    if abs(change_pct) >= abs(value):
+                        triggered = True
+                except Exception:
+                    logger.exception("percent change calc failed")
         else:
-            # absolute: trigger on crossing
-            if prev_price is not None:
-                if (prev_price < value and cur_price >= value) or (prev_price > value and cur_price <= value):
-                    triggered = True
-            else:
-                # fallback if no prev: trigger if current meets condition >= value
-                if cur_price >= value:
-                    triggered = True
+            # absolute crossing
+            try:
+                v = float(value)
+                if prev_price is not None:
+                    if (prev_price < v and cur_price >= v) or (prev_price > v and cur_price <= v):
+                        triggered = True
+                else:
+                    if cur_price >= v:
+                        triggered = True
+            except Exception:
+                logger.exception("absolute alert value parse failed for %s", value)
 
         if triggered:
             try:
-                send_message(chat_id, f"🔔 Alert: {symbol} {'%' if is_pct else '$'}{value} — current {cur_price}")
+                send_message(chat_id, f"🔔 Alert сработал: {symbol} {'%' if is_pct else '$'}{value} — текущая {cur_price}$")
                 log_db("info", f"Alert fired for {chat_id} {symbol} {value}{'%' if is_pct else '$'}")
             except Exception:
                 logger.exception("send alert message failed")
@@ -587,7 +653,7 @@ def check_alerts():
                 except Exception:
                     logger.exception("deactivate alert failed")
 
-# ---------------- Autosignals checking ----------------
+# ---------------- Autosignals (RSI/EMA) ----------------
 def calculate_rsi(prices, period=14):
     if not HAS_PANDAS:
         return []
@@ -609,13 +675,16 @@ def calculate_ema(prices, span):
 
 def fetch_ohlcv_safe(symbol, timeframe="1m", limit=200):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        return ohlcv
+        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception:
         logger.exception("fetch_ohlcv failed for %s %s", symbol, timeframe)
         return []
 
 def check_autosignals():
+    """
+    Evaluate autosignals subscriptions: for each subscription, fetch OHLCV and compute RSI/EMA.
+    Send notification if condition met and last_notified older than threshold.
+    """
     try:
         with db_lock:
             cur.execute("SELECT id, chat_id, symbol, timeframe, enabled, last_notified FROM autosignals WHERE enabled=1")
@@ -623,6 +692,7 @@ def check_autosignals():
     except Exception:
         logger.exception("list_autosignals error")
         rows = []
+
     for r in rows:
         aid, chat_id, symbol, timeframe, enabled, last_notified = r
         ohlcv = fetch_ohlcv_safe(symbol, timeframe=timeframe, limit=200)
@@ -632,32 +702,32 @@ def check_autosignals():
         if len(closes) < 20:
             continue
         signal_msg = None
-        if HAS_PANDAS:
-            rsi = calculate_rsi(closes, 14)[-1]
-            ema5 = calculate_ema(closes, 5)[-1]
-            ema20 = calculate_ema(closes, 20)[-1]
-            # RSI logic
-            if rsi > 70:
-                signal_msg = f"🔻 {symbol} {timeframe}: RSI {rsi:.1f} (overbought) — consider SHORT"
-            elif rsi < 30:
-                signal_msg = f"🔺 {symbol} {timeframe}: RSI {rsi:.1f} (oversold) — consider LONG"
-            # EMA cross (confirm)
-            # We'll detect cross from previous candle
-            ema5_series = calculate_ema(closes, 5)
-            ema20_series = calculate_ema(closes, 20)
-            if len(ema5_series) >= 2 and len(ema20_series) >= 2:
-                if ema5_series[-2] <= ema20_series[-2] and ema5_series[-1] > ema20_series[-1]:
-                    signal_msg = f"🔺 {symbol} {timeframe}: EMA5 crossed above EMA20 (LONG)"
-                elif ema5_series[-2] >= ema20_series[-2] and ema5_series[-1] < ema20_series[-1]:
-                    signal_msg = f"🔻 {symbol} {timeframe}: EMA5 crossed below EMA20 (SHORT)"
+        try:
+            if HAS_PANDAS:
+                rsi = calculate_rsi(closes, 14)[-1]
+                ema5 = calculate_ema(closes, 5)[-1]
+                ema20 = calculate_ema(closes, 20)[-1]
+                # RSI signals
+                if rsi > 70:
+                    signal_msg = f"🔻 {symbol} {timeframe}: RSI {rsi:.1f} (overbought) — consider SHORT"
+                elif rsi < 30:
+                    signal_msg = f"🔺 {symbol} {timeframe}: RSI {rsi:.1f} (oversold) — consider LONG"
+                # EMA cross detection (use last two)
+                ema5_series = calculate_ema(closes, 5)
+                ema20_series = calculate_ema(closes, 20)
+                if len(ema5_series) >= 2 and len(ema20_series) >= 2:
+                    if ema5_series[-2] <= ema20_series[-2] and ema5_series[-1] > ema20_series[-1]:
+                        signal_msg = f"🔺 {symbol} {timeframe}: EMA5 crossed above EMA20 (LONG)"
+                    elif ema5_series[-2] >= ema20_series[-2] and ema5_series[-1] < ema20_series[-1]:
+                        signal_msg = f"🔻 {symbol} {timeframe}: EMA5 crossed below EMA20 (SHORT)"
+        except Exception:
+            logger.exception("indicator calc failed")
 
-        # throttle notifications: don't spam - use last_notified
         should_notify = True
         if last_notified:
             try:
                 last_dt = datetime.strptime(last_notified, "%Y-%m-%d %H:%M:%S")
-                # don't notify more than once per 15 minutes by default
-                if datetime.utcnow() - last_dt < timedelta(minutes=15):
+                if datetime.utcnow() - last_dt < timedelta(seconds=AUTOSIGNAL_MIN_INTERVAL):
                     should_notify = False
             except Exception:
                 should_notify = True
@@ -672,61 +742,82 @@ def check_autosignals():
             except Exception:
                 logger.exception("notify autosignal failed")
 
-# ---------------- Chart building (candles) ----------------
+# ---------------- Chart building ----------------
 def build_candlestick_chart(symbol, timeframe="1h", limit=200):
-    if not HAS_PANDAS or not HAS_MATPLOTLIB:
-        return None, "pandas or matplotlib not installed on server"
-
-    ohlcv = fetch_ohlcv_safe(symbol, timeframe=timeframe, limit=limit)
-    if not ohlcv:
-        return None, "No OHLCV data from exchange"
-
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    df['date'] = pd.to_datetime(df['ts'], unit='ms')
-    df.set_index('date', inplace=True)
-    df = df[["open","high","low","close","volume"]]
-
-    import io
-    buf = io.BytesIO()
+    """
+    Build candlestick chart as bytes (BytesIO) and return (buf, None) or (None, error_message)
+    Uses mplfinance if available; otherwise manual drawing with matplotlib.
+    """
     try:
+        if not HAS_PANDAS or not HAS_MATPLOTLIB:
+            return None, "pandas or matplotlib not installed on server"
+
+        ohlcv = fetch_ohlcv_safe(symbol, timeframe=timeframe, limit=limit)
+        if not ohlcv:
+            return None, "No OHLCV data from exchange"
+
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        df['date'] = pd.to_datetime(df['ts'], unit='ms')
+        df.set_index('date', inplace=True)
+        df = df[["open","high","low","close","volume"]]
+
+        import io
+        buf = io.BytesIO()
         if HAS_MPLFINANCE:
-            mpf.plot(df, type='candle', style='charles', volume=True, savefig=buf, figsize=(10,6))
-            buf.seek(0)
-            return buf, None
-        else:
-            fig, ax = plt.subplots(figsize=(10,6))
-            # convert dates
-            df_reset = df.reset_index()
-            dates = mdates.date2num(df_reset['date'].to_pydatetime())
-            # width
-            width = (dates[1] - dates[0]) * 0.6 if len(dates) > 1 else 0.002
-            for idx, row in df_reset.iterrows():
-                color = 'green' if row['close'] >= row['open'] else 'red'
-                ax.vlines(dates[idx], row['low'], row['high'], color='black', linewidth=0.5)
-                ax.add_patch(plt.Rectangle((dates[idx]-width/2, min(row['open'], row['close'])), width, abs(row['open']-row['close']), color=color))
-            ax.xaxis_date()
-            ax.set_title(f"{symbol} {timeframe}")
-            ax.grid(True)
-            plt.tight_layout()
-            fig.savefig(buf, format='png', dpi=150)
-            plt.close(fig)
-            buf.seek(0)
-            return buf, None
+            # mplfinance can save to BytesIO by passing savefig=dict
+            try:
+                mpf.plot(df, type='candle', style='charles', volume=True, savefig=dict(fname=buf, dpi=150, bbox_inches="tight"))
+                buf.seek(0)
+                return buf, None
+            except Exception:
+                logger.exception("mplfinance plot failed; falling back")
+        # Fallback manual:
+        fig, ax = plt.subplots(figsize=(10,6))
+        df_reset = df.reset_index()
+        dates = mdates.date2num(df_reset['date'].to_pydatetime())
+        width = max(0.0005, (dates[1] - dates[0]) * 0.6) if len(dates) > 1 else 0.0005
+        for idx, row in df_reset.iterrows():
+            color = 'green' if row['close'] >= row['open'] else 'red'
+            ax.vlines(dates[idx], row['low'], row['high'], color='black', linewidth=0.5)
+            ax.add_patch(plt.Rectangle((dates[idx]-width/2, min(row['open'], row['close'])), width, abs(row['open']-row['close']), color=color))
+        ax.xaxis_date()
+        ax.set_title(f"{symbol} {timeframe}")
+        ax.grid(True)
+        plt.tight_layout()
+        fig.savefig(buf, format='png', dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        return buf, None
     except Exception:
         logger.exception("build_candlestick_chart error")
         return None, "chart generation failed"
 
 # ---------------- Background workers ----------------
 def price_poll_worker():
-    logger.info("Price poll worker started")
+    logger.info("Price poll worker started (interval %s s)", PRICE_POLL_INTERVAL)
     while True:
         try:
             syms = fetch_all_user_symbols()
-            for s in syms:
-                try:
-                    fetch_price_for(s)
-                except Exception:
-                    logger.exception("fetch price failed for %s", s)
+            # bulk fetch
+            prices = fetch_tickers_bulk(syms)
+            now_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            for s, p in prices.items():
+                if p is None:
+                    # try single fetch fallback
+                    try:
+                        p = fetch_price_for(s)
+                    except Exception:
+                        p = None
+                if p is not None:
+                    last_prices[s] = p
+                    try:
+                        with db_lock:
+                            cur.execute("INSERT INTO history (symbol, price, ts) VALUES (?, ?, ?)", (s, float(p), now_ts))
+                            conn.commit()
+                    except Exception:
+                        logger.exception("history insert failed")
+                    history_cache[s].append((now_ts, float(p)))
+            # Now process alerts based on updated last_prices/history_cache
             check_alerts()
         except Exception:
             logger.exception("price_poll_worker exception")
@@ -754,17 +845,18 @@ def safe_thread(target, name):
     t.start()
     return t
 
+# start background threads
 safe_thread(price_poll_worker, "price_poll_worker")
 safe_thread(autosignal_worker, "autosignal_worker")
 
-# ---------------- Flask Webhook ----------------
+# ---------------- Flask webhook ----------------
 app = Flask(__name__)
 
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook():
     try:
         data = request.get_json() or {}
-        # Callback queries (button presses)
+        # Callback query (button)
         if "callback_query" in data:
             cb = data["callback_query"]
             cb_id = cb.get("id")
@@ -779,25 +871,26 @@ def telegram_webhook():
             add_user(chat_id)
             log_db("info", f"callback {action} from {chat_id}")
 
-            # Main navigation
+            # Navigation
             if action == "main":
                 edit_message(chat_id, msg_id, "🏠 Главное меню", kb_main_menu())
                 answer_callback(cb_id)
                 return {"ok": True}
 
-            # Price: immediately send all prices (Last + Fair)
+            # Price: send all prices (fast)
             if action == "price_all":
                 syms = fetch_all_user_symbols()
+                prices = fetch_tickers_bulk(syms)
                 lines = []
                 for s in syms:
-                    last = last_prices.get(s) or fetch_price_for(s)
+                    last = prices.get(s) or last_prices.get(s) or fetch_price_for(s)
                     fair = fetch_mexc_fair_price(s)
                     lines.append(f"{s}: last {last if last is not None else 'N/A'}$, fair {fair if fair is not None else 'N/A'}$")
                 send_message(chat_id, "💰 Цены (источник: MEXC):\n" + "\n".join(lines), kb_main_menu())
                 answer_callback(cb_id)
                 return {"ok": True}
 
-            # Chart menu -> choose coin (buttons)
+            # Chart menu
             if action == "chart_menu":
                 edit_message(chat_id, msg_id, "📊 Выберите монету для графика:", kb_chart_symbols(chat_id))
                 answer_callback(cb_id)
@@ -810,7 +903,6 @@ def telegram_webhook():
                 return {"ok": True}
 
             if action.startswith("chart_tf_"):
-                # format: chart_tf_<symbol>_<tf>
                 try:
                     _, rest = action.split("chart_tf_",1)
                     symbol, tf = rest.rsplit("_",1)
@@ -833,7 +925,6 @@ def telegram_webhook():
                 return {"ok": True}
 
             if action == "add_alert":
-                # start: choose type % or $
                 pending_alerts[str(chat_id)] = {"state":"awaiting_alert_type"}
                 edit_message(chat_id, msg_id, "➕ Выберите тип алерта", kb_alert_type())
                 answer_callback(cb_id)
@@ -855,25 +946,21 @@ def telegram_webhook():
                 symbol = action.split("alert_symbol_",1)[1]
                 key = str(chat_id)
                 if key in pending_alerts and pending_alerts[key].get("state") == "awaiting_alert_value":
-                    # if user already entered value textually, it should be in pending_alerts
                     val = pending_alerts[key].get("value")
                     is_pct = pending_alerts[key].get("is_percent", 0)
                     if val is None:
-                        # prompt user to enter numeric value in chat then press symbol button again
                         send_message(chat_id, f"Вы ещё не ввели значение. Введите число ({'%' if is_pct else '$'}) в текстовом сообщении, затем нажмите монету.")
                         answer_callback(cb_id)
                         return {"ok": True}
-                    # else we have value
                     alert_id = save_alert(chat_id, symbol, is_pct, val, is_recurring=0)
                     if alert_id:
                         send_message(chat_id, f"✅ Алерт сохранён: {symbol} {'%' if is_pct else '$'}{val}", kb_main_menu())
                         del pending_alerts[key]
                     else:
-                        send_message(chat_id, "Ошибка при сохранении алерта.")
+                        send_message(chat_id, "Ошибка при сохранении алерта. Проверьте вводимое число.")
                 else:
-                    # maybe direct add without pending state -> ask for value
                     pending_alerts[str(chat_id)] = {"state":"awaiting_value_for_symbol", "symbol": symbol}
-                    send_message(chat_id, f"Вы выбрали {symbol}. Теперь введите значение (например: 50 или 2.5%) в текстовом сообщении.")
+                    send_message(chat_id, f"Вы выбрали {symbol}. Теперь введите значение (например: 50 или 2.5) в текстовом сообщении.")
                 answer_callback(cb_id)
                 return {"ok": True}
 
@@ -951,7 +1038,6 @@ def telegram_webhook():
 
             if action.startswith("autosignal_item_"):
                 aid = int(action.split("_")[-1])
-                # toggle enable/disable
                 with db_lock:
                     cur.execute("SELECT enabled, symbol, timeframe FROM autosignals WHERE id=?", (aid,))
                     r = cur.fetchone()
@@ -982,7 +1068,7 @@ def telegram_webhook():
             logger.warning("Unknown callback: %s", action)
             return {"ok": True}
 
-        # Message handling (text)
+        # ---- Message handling (text) ----
         msg = data.get("message") or data.get("edited_message")
         if not msg:
             return {"ok": True}
@@ -993,12 +1079,11 @@ def telegram_webhook():
         add_user(chat_id)
         log_db("info", f"msg from {chat_id}: {text}")
 
-        # Pending flows handling
+        # Pending flow handling
         key = str(chat_id)
         if key in pending_alerts:
             st = pending_alerts[key].get("state")
             if st == "awaiting_alert_value":
-                # user typed numeric value; we store it and instruct to press coin button
                 try:
                     val = float(text.replace(",","."))
                     pending_alerts[key]["value"] = val
@@ -1006,21 +1091,20 @@ def telegram_webhook():
                 except Exception:
                     send_message(chat_id, "Неверное число. Введите число (например: 50 или 2.5).")
                 return {"ok": True}
-
             if st == "awaiting_value_for_symbol":
-                # user previously clicked a symbol, we asked for value
                 try:
                     val = float(text.replace(",","."))
                     symbol = pending_alerts[key].get("symbol")
-                    # determine percent or usd? assume USD by default
                     is_pct = pending_alerts[key].get("is_percent", 0)
-                    save_alert(chat_id, symbol, is_pct, val, is_recurring=0)
-                    send_message(chat_id, f"✅ Алерт сохранён: {symbol} {'%' if is_pct else '$'}{val}", kb_main_menu())
-                    del pending_alerts[key]
+                    aid = save_alert(chat_id, symbol, is_pct, val, is_recurring=0)
+                    if aid:
+                        send_message(chat_id, f"✅ Алерт сохранён: {symbol} {'%' if is_pct else '$'}{val}", kb_main_menu())
+                        del pending_alerts[key]
+                    else:
+                        send_message(chat_id, "Ошибка при сохранении алерта. Проверьте введённое число.")
                 except Exception:
                     send_message(chat_id, "Неверное число. Введите число снова.")
                 return {"ok": True}
-
             if st == "awaiting_edit_value":
                 try:
                     newval = float(text.replace(",","."))
@@ -1035,9 +1119,9 @@ def telegram_webhook():
                     send_message(chat_id, "Ошибка при обновлении алерта.")
                 return {"ok": True}
 
-        # Normal commands (fallback)
+        # Commands fallback
         if text.startswith("/start"):
-            send_message(chat_id, "👋 Привет! Я крипто-бот (цены: MEXC). Управление через кнопки.", kb_main_menu())
+            send_message(chat_id, "👋 Привет! Я крипто-бот (цены и сигналы от MEXC). Управление через кнопки.", kb_main_menu())
             return {"ok": True}
 
         if text.startswith("/price"):
@@ -1046,6 +1130,7 @@ def telegram_webhook():
                 s = parts[1].upper()
                 if "/" not in s:
                     s = s + "/USDT"
+                # fast attempt via cache or single fetch
                 last = last_prices.get(s) or fetch_price_for(s)
                 fair = fetch_mexc_fair_price(s)
                 send_message(chat_id, f"{s}: last {last if last is not None else 'N/A'}$, fair {fair if fair is not None else 'N/A'}$", kb_main_menu())
@@ -1082,7 +1167,7 @@ def telegram_webhook():
                 send_message(chat_id, "📋 Мои алерты:\n" + "\n".join(lines), kb_alerts_menu())
             return {"ok": True}
 
-        # fallback: show main menu
+        # Show main menu by default
         send_message(chat_id, "Выберите действие:", kb_main_menu())
         return {"ok": True}
 
@@ -1090,7 +1175,7 @@ def telegram_webhook():
         logger.exception("telegram_webhook exception")
         return {"ok": True}
 
-# ---------------- Start Flask ----------------
+# ---------------- Run Flask app ----------------
 if __name__ == "__main__":
     logger.info("Bot started. Webhook endpoint: /%s", TELEGRAM_TOKEN)
     logger.info("If running on Railway, set TELEGRAM_TOKEN variable and set webhook to https://<your-app>/%s", TELEGRAM_TOKEN)
