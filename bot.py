@@ -1036,3 +1036,12 @@ if __name__ == '__main__':
         executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
     except Exception:
         logger.exception("executor.start_polling failed")
+
+import asyncio
+
+async def main():
+    # тут твои настройки бота
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
