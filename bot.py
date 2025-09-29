@@ -57,11 +57,11 @@ except Exception:
 import numpy as np
 
 # ---------- Configuration ----------
-# Defaults
+# async defaults
 DB_PATH = os.getenv("DB_PATH", "bot_data.sqlite")
 PRICE_POLL_INTERVAL = int(os.getenv("PRICE_POLL_INTERVAL", "5"))  # seconds
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "1000"))
-DEFAULT_SYMBOLS = os.getenv("DEFAULT_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,NEAR/USDT").split(",")
+defAULT_SYMBOLS = os.getenv("async defAULT_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,NEAR/USDT").split(",")
 PRICE_FETCH_TIMEOUT = float(os.getenv("PRICE_FETCH_TIMEOUT", "5.0"))
 USE_WEBHOOK = os.getenv("USE_WEBHOOK", "").lower() in ("1", "true", "yes")
 
@@ -70,7 +70,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("crypto_bot")
 
 # ---------- Token handling ----------
-def load_token() -> Optional[str]:
+async def load_token() -> Optional[str]:
     """Load TELEGRAM_TOKEN from env or token.txt; if interactive, ask and save."""
     token = os.getenv("TELEGRAM_TOKEN")
     if token:
@@ -128,7 +128,7 @@ except Exception as e:
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
-def init_db():
+async def init_db():
     try:
         cur.executescript("""
         CREATE TABLE IF NOT EXISTS users (
@@ -145,28 +145,28 @@ def init_db():
             chat_id TEXT,
             symbol TEXT,
             target REAL,
-            alert_type TEXT DEFAULT 'cross',
-            is_recurring INTEGER DEFAULT 0,
-            active_until TEXT DEFAULT NULL,
-            time_start TEXT DEFAULT NULL,
-            time_end TEXT DEFAULT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            alert_type TEXT async defAULT 'cross',
+            is_recurring INTEGER async defAULT 0,
+            active_until TEXT async defAULT NULL,
+            time_start TEXT async defAULT NULL,
+            time_end TEXT async defAULT NULL,
+            created_at DATETIME async defAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT,
             price REAL,
-            ts DATETIME DEFAULT CURRENT_TIMESTAMP
+            ts DATETIME async defAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             level TEXT,
             message TEXT,
-            ts DATETIME DEFAULT CURRENT_TIMESTAMP
+            ts DATETIME async defAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS user_settings (
             chat_id TEXT PRIMARY KEY,
-            signals_enabled INTEGER DEFAULT 0
+            signals_enabled INTEGER async defAULT 0
         );
         """)
         conn.commit()
@@ -177,7 +177,7 @@ def init_db():
 init_db()
 
 # ---------- Logging helper (store in DB + logger) ----------
-def log_db(level: str, message: str):
+async def log_db(level: str, message: str):
     try:
         cur.execute("INSERT INTO logs (level, message) VALUES (?, ?)", (level.upper(), message))
         conn.commit()
@@ -192,14 +192,14 @@ last_prices = {}     # symbol -> price
 history_cache = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
 
 # ---------- DB wrappers ----------
-def add_user(chat_id: int):
+async def add_user(chat_id: int):
     try:
         cur.execute("INSERT OR IGNORE INTO users (chat_id, created_at) VALUES (?, ?)", (str(chat_id), datetime.utcnow()))
         conn.commit()
     except Exception:
         logger.exception("add_user error")
 
-def get_user_symbols(chat_id: int) -> List[str]:
+async def get_user_symbols(chat_id: int) -> List[str]:
     try:
         cur.execute("SELECT symbol FROM user_symbols WHERE chat_id=?", (str(chat_id),))
         rows = cur.fetchall()
@@ -207,9 +207,9 @@ def get_user_symbols(chat_id: int) -> List[str]:
             return [r[0] for r in rows]
     except Exception:
         logger.exception("get_user_symbols error")
-    return DEFAULT_SYMBOLS.copy()
+    return  defAULT_SYMBOLS.copy()
 
-def add_user_symbol(chat_id: int, symbol: str) -> bool:
+async def add_user_symbol(chat_id: int, symbol: str) -> bool:
     try:
         cur.execute("INSERT INTO user_symbols (chat_id, symbol) VALUES (?, ?)", (str(chat_id), symbol))
         conn.commit()
@@ -218,7 +218,7 @@ def add_user_symbol(chat_id: int, symbol: str) -> bool:
         logger.exception("add_user_symbol error")
         return False
 
-def list_user_alerts(chat_id: int):
+async def list_user_alerts(chat_id: int):
     try:
         cur.execute("SELECT id, symbol, target, alert_type, is_recurring, active_until FROM alerts WHERE chat_id=? ORDER BY id DESC", (str(chat_id),))
         return cur.fetchall()
@@ -226,14 +226,14 @@ def list_user_alerts(chat_id: int):
         logger.exception("list_user_alerts error")
         return []
 
-def delete_alert(alert_id: int, chat_id: int):
+async def delete_alert(alert_id: int, chat_id: int):
     try:
         cur.execute("DELETE FROM alerts WHERE id=? AND chat_id=?", (int(alert_id), str(chat_id)))
         conn.commit()
     except Exception:
         logger.exception("delete_alert error")
 
-def save_alert_to_db(chat_id: int, symbol: str, target: float, alert_type='cross', is_recurring=0, active_until=None, time_start=None, time_end=None):
+async def save_alert_to_db(chat_id: int, symbol: str, target: float, alert_type='cross', is_recurring=0, active_until=None, time_start=None, time_end=None):
     try:
         cur.execute(
             "INSERT INTO alerts (chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -245,7 +245,7 @@ def save_alert_to_db(chat_id: int, symbol: str, target: float, alert_type='cross
         logger.exception("save_alert_to_db error")
         return False
 
-def get_all_alerts():
+async def get_all_alerts():
     try:
         cur.execute("SELECT id, chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end FROM alerts")
         return cur.fetchall()
@@ -254,7 +254,7 @@ def get_all_alerts():
         return []
 
 # ---------- Telegram UI helpers ----------
-def main_menu_kb():
+async def main_menu_kb():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(InlineKeyboardButton("💰 Все цены", callback_data="price_all"),
            InlineKeyboardButton("📊 График", callback_data="chart_menu"))
@@ -264,21 +264,21 @@ def main_menu_kb():
            InlineKeyboardButton("⚙️ Настройки", callback_data="settings"))
     return kb
 
-def price_menu_kb(symbols: List[str]):
+async def price_menu_kb(symbols: List[str]):
     kb = InlineKeyboardMarkup(row_width=3)
     for s in symbols:
         kb.insert(InlineKeyboardButton(s.split("/")[0], callback_data=f"price_{s.split('/')[0]}"))
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
     return kb
 
-def symbols_keyboard(symbols: List[str], prefix: str, per_row=3):
+async def symbols_keyboard(symbols: List[str], prefix: str, per_row=3):
     kb = InlineKeyboardMarkup(row_width=per_row)
     for s in symbols:
         kb.insert(InlineKeyboardButton(s.split("/")[0], callback_data=f"{prefix}_{s.split('/')[0]}"))
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
     return kb
 
-def price_steps_kb(include_confirm=True):
+async def price_steps_kb(include_confirm=True):
     steps = [-10000, -5000, -1000, -100, -10, -1, 1, 10, 100, 1000, 5000, 10000]
     kb = InlineKeyboardMarkup(row_width=6)
     # show sign-less labels for negative rows
@@ -294,7 +294,7 @@ def price_steps_kb(include_confirm=True):
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
     return kb
 
-def autotime_kb():
+async def autotime_kb():
     kb = InlineKeyboardMarkup(row_width=3)
     kb.row(InlineKeyboardButton("5s", callback_data="auto_5"),
            InlineKeyboardButton("10s", callback_data="auto_10"),
@@ -304,7 +304,7 @@ def autotime_kb():
     return kb
 
 # ---------- Price fetching logic (background thread) ----------
-def fetch_price_for_symbol(symbol: str) -> Optional[float]:
+async def fetch_price_for_symbol(symbol: str) -> Optional[float]:
     """Synchronous fetch from ccxt mexc. Returns last price or None."""
     if not exchange:
         return None
@@ -318,20 +318,20 @@ def fetch_price_for_symbol(symbol: str) -> Optional[float]:
         logger.debug("fetch error %s: %s", symbol, str(e))
         return None
 
-def price_polling_worker(stop_event: threading.Event):
+async def price_polling_worker(stop_event: threading.Event):
     """Background thread that polls prices, saves to DB, checks alerts."""
     logger.info("Price polling worker started, interval %s sec", PRICE_POLL_INTERVAL)
     while not stop_event.is_set():
         try:
-            # build symbols list from DB + defaults
+            # build symbols list from DB + async defaults
             try:
                 cur.execute("SELECT DISTINCT symbol FROM user_symbols")
                 rows = cur.fetchall()
-                symbols = set(DEFAULT_SYMBOLS)
+                symbols = set( defAULT_SYMBOLS)
                 symbols.update(r[0] for r in rows)
             except Exception:
                 logger.exception("Error building symbol list")
-                symbols = set(DEFAULT_SYMBOLS)
+                symbols = set( defAULT_SYMBOLS)
 
             for sym in list(symbols):
                 try:
@@ -361,7 +361,7 @@ def price_polling_worker(stop_event: threading.Event):
     logger.info("Price polling worker stopping")
 
 # ---------- Alert checking (uses last_prices and history_cache) ----------
-def is_within_time_window(time_start: Optional[str], time_end: Optional[str]) -> bool:
+async def is_within_time_window(time_start: Optional[str], time_end: Optional[str]) -> bool:
     if not time_start or not time_end:
         return True
     now = datetime.utcnow().strftime("%H:%M")
@@ -370,7 +370,7 @@ def is_within_time_window(time_start: Optional[str], time_end: Optional[str]) ->
     except Exception:
         return True
 
-def check_alerts():
+async def check_alerts():
     """Checks DB alerts against last_prices/history and sends messages via bot (from background thread)."""
     alerts = get_all_alerts()
     for alert in alerts:
@@ -416,7 +416,7 @@ def check_alerts():
                 # schedule coroutine from thread
                 loop = dp.loop
                 if loop and loop.is_running():
-                    loop.call_soon_threadsafe(lambda: dp.loop.create_task(bot.send_message(chat_id, text)))
+                    loop.call_soon_threadsafe(lambda: dp.loop.create_task( bot.send_message(chat_id, text)))
                 else:
                     logger.warning("Event loop not running, cannot send alert to %s", chat_id)
                 log_db("info", f"Alert fired for {chat_id} {symbol} {alert_type} {target}")
@@ -431,7 +431,7 @@ def check_alerts():
                     logger.exception("Failed to delete one-time alert %s", alert_id)
 
 # ---------- Chart generation ----------
-def build_candlestick_chart(symbol: str, timeframe: str = "1m", points: int = 200):
+async def build_candlestick_chart(symbol: str, timeframe: str = "1m", points: int = 200):
     """
     Build candlestick chart using history DB or last_prices.
     timeframe not used to fetch new data here; assumes history has sufficiently frequent rows.
@@ -500,17 +500,17 @@ def build_candlestick_chart(symbol: str, timeframe: str = "1m", points: int = 20
 
 # ---------- Bot handlers: commands + callbacks ----------
 @dp.message_handler(commands=['start', 'help'])
-async def cmd_start(message: types.Message):
+async  def cmd_start(message: types.Message):
     try:
         add_user(message.chat.id)
         send_text = ("👋 Привет! Я крипто-бот.\n\n"
                      "Управление через кнопки. Нажми кнопку ниже.")
-        await bot.send_message(message.chat.id, send_text, reply_markup=main_menu_kb())
+        await  bot.send_message(message.chat.id, send_text, reply_markup=main_menu_kb())
     except Exception:
         logger.exception("cmd_start error")
 
 @dp.callback_query_handler(lambda c: c.data == 'back_main')
-def cb_back_main(callback_query: types.CallbackQuery):
+async def cb_back_main(callback_query: types.CallbackQuery):
     try:
         bot.edit_message_text("Главное меню:", callback_query.from_user.id, callback_query.message.message_id, reply_markup=main_menu_kb())
         bot.answer_callback_query(callback_query.id)
@@ -523,12 +523,12 @@ def cb_back_main(callback_query: types.CallbackQuery):
 
 # Price all
 @dp.callback_query_handler(lambda c: c.data == 'price_all')
-def cb_price_all(callback_query: types.CallbackQuery):
+async def cb_price_all(callback_query: types.CallbackQuery):
     try:
         add_user(callback_query.from_user.id)
         text_lines = []
-        # gather symbols (user-specific plus defaults)
-        syms = set(DEFAULT_SYMBOLS)
+        # gather symbols (user-specific plus async defaults)
+        syms = set( defAULT_SYMBOLS)
         try:
             cur.execute("SELECT DISTINCT symbol FROM user_symbols WHERE chat_id=?", (str(callback_query.from_user.id),))
             rows = cur.fetchall()
@@ -540,19 +540,19 @@ def cb_price_all(callback_query: types.CallbackQuery):
             display = f"{price}$" if price is not None else "n/a"
             text_lines.append(f"{s}: {display}")
         msg = "\n".join(text_lines) if text_lines else "Нет данных"
-        bot.send_message(callback_query.from_user.id, f"💱 Текущие цены:\n{msg}", reply_markup=main_menu_kb())
+        await bot.send_message(callback_query.from_user.id, f"💱 Текущие цены:\n{msg}", reply_markup=main_menu_kb())
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_price_all error")
 
 # Price single by symbol from inline buttons
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("price_"))
-def cb_price_single(callback_query: types.CallbackQuery):
+async def cb_price_single(callback_query: types.CallbackQuery):
     try:
         symbol_label = callback_query.data.split("_",1)[1]
-        # find full symbol (search in user list and defaults)
+        # find full symbol (search in user list and async defaults)
         full = None
-        candidates = DEFAULT_SYMBOLS.copy()
+        candidates = defAULT_SYMBOLS.copy()
         try:
             cur.execute("SELECT symbol FROM user_symbols WHERE chat_id=?", (str(callback_query.from_user.id),))
             rows = cur.fetchall()
@@ -568,24 +568,24 @@ def cb_price_single(callback_query: types.CallbackQuery):
             bot.answer_callback_query(callback_query.id, text="Монета не найдена")
             return
         price = last_prices.get(full)
-        bot.send_message(callback_query.from_user.id, f"💰 {full}: {price if price is not None else 'n/a'}$", reply_markup=main_menu_kb())
+        await bot.send_message(callback_query.from_user.id, f"💰 {full}: {price if price is not None else 'n/a'}$", reply_markup=main_menu_kb())
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_price_single error")
 
 # Chart menu: choose symbol then timeframe
 @dp.callback_query_handler(lambda c: c.data == 'chart_menu')
-def cb_chart_menu(callback_query: types.CallbackQuery):
+async def cb_chart_menu(callback_query: types.CallbackQuery):
     try:
         syms = get_user_symbols(callback_query.from_user.id)
         kb = symbols_keyboard(syms, prefix="chart", per_row=3)
-        bot.send_message(callback_query.from_user.id, "Выберите монету для графика:", reply_markup=kb)
+        await bot.send_message(callback_query.from_user.id, "Выберите монету для графика:", reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_chart_menu error")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("chart_"))
-def cb_chart_choose_symbol(callback_query: types.CallbackQuery):
+async def cb_chart_choose_symbol(callback_query: types.CallbackQuery):
     try:
         label = callback_query.data.split("_",1)[1]
         # save pending state
@@ -595,13 +595,13 @@ def cb_chart_choose_symbol(callback_query: types.CallbackQuery):
         for tf in ["1m","5m","15m","30m","1h","4h","1d"]:
             kb.insert(InlineKeyboardButton(tf, callback_data=f"chart_tf_{tf}"))
         kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        bot.send_message(callback_query.from_user.id, f"Выбрана {label}. Выберите таймфрейм:", reply_markup=kb)
+        await bot.send_message(callback_query.from_user.id, f"Выбрана {label}. Выберите таймфрейм:", reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_chart_choose_symbol error")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("chart_tf_"))
-def cb_chart_generate(callback_query: types.CallbackQuery):
+async def cb_chart_generate(callback_query: types.CallbackQuery):
     try:
         tf = callback_query.data.split("_",2)[2]
         key = str(callback_query.from_user.id)
@@ -623,7 +623,7 @@ def cb_chart_generate(callback_query: types.CallbackQuery):
         bot.answer_callback_query(callback_query.id, text="Генерирую график... (может занять время)")
         imgbuf = build_candlestick_chart(full, timeframe=tf, points=200)
         if not imgbuf:
-            bot.send_message(callback_query.from_user.id, "Не удалось построить график (недостаточно данных или отсутствуют библиотеки).", reply_markup=main_menu_kb())
+            await bot.send_message(callback_query.from_user.id, "Не удалось построить график (недостаточно данных или отсутствуют библиотеки).", reply_markup=main_menu_kb())
             return
         # send as photo
         try:
@@ -636,23 +636,23 @@ def cb_chart_generate(callback_query: types.CallbackQuery):
                 bot.send_document(callback_query.from_user.id, ('chart.png', imgbuf), caption=f"{full} {tf}")
             except Exception:
                 logger.exception("Failed to send chart")
-                bot.send_message(callback_query.from_user.id, "Ошибка при отправке графика.")
+                await bot.send_message(callback_query.from_user.id, "Ошибка при отправке графика.")
     except Exception:
         logger.exception("cb_chart_generate error")
 
 # Add alert flow: choose coin via buttons
 @dp.callback_query_handler(lambda c: c.data == 'add_alert')
-def cb_add_alert_start(callback_query: types.CallbackQuery):
+async def cb_add_alert_start(callback_query: types.CallbackQuery):
     try:
         syms = get_user_symbols(callback_query.from_user.id)
         kb = symbols_keyboard(syms, prefix="set_alert", per_row=3)
-        bot.send_message(callback_query.from_user.id, "Выберите монету для создания alert:", reply_markup=kb)
+        await bot.send_message(callback_query.from_user.id, "Выберите монету для создания alert:", reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_add_alert_start error")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("set_alert_"))
-def cb_add_alert_choose(callback_query: types.CallbackQuery):
+async def cb_add_alert_choose(callback_query: types.CallbackQuery):
     try:
         coin = callback_query.data.split("_",2)[2]
         symbol = coin + "/USDT"
@@ -670,13 +670,13 @@ def cb_add_alert_choose(callback_query: types.CallbackQuery):
             "awaiting_type": False
         }
         kb = price_steps_kb(include_confirm=True)
-        resp = bot.send_message(callback_query.from_user.id, f"{coin}\nБазовая цена: {base_price}$\nНастройте цену кнопками:", reply_markup=kb)
+        resp = await bot.send_message(callback_query.from_user.id, f"{coin}\nБазовая цена: {base_price}$\nНастройте цену кнопками:", reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_add_alert_choose error")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("step_"))
-def cb_price_step(callback_query: types.CallbackQuery):
+async def cb_price_step(callback_query: types.CallbackQuery):
     try:
         raw = callback_query.data.split("_",1)[1]
         try:
@@ -705,13 +705,13 @@ def cb_price_step(callback_query: types.CallbackQuery):
                 bot.edit_message_text(text, callback_query.from_user.id, callback_query.message.message_id, reply_markup=price_steps_kb(include_confirm=True))
         except Exception:
             # fallback: send new message
-            bot.send_message(callback_query.from_user.id, text, reply_markup=price_steps_kb(include_confirm=True))
+            await bot.send_message(callback_query.from_user.id, text, reply_markup=price_steps_kb(include_confirm=True))
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_price_step error")
 
 @dp.callback_query_handler(lambda c: c.data == 'auto_time')
-def cb_auto_time(callback_query: types.CallbackQuery):
+async def cb_auto_time(callback_query: types.CallbackQuery):
     try:
         key = str(callback_query.from_user.id)
         if key not in pending_alerts:
@@ -723,7 +723,7 @@ def cb_auto_time(callback_query: types.CallbackQuery):
         logger.exception("cb_auto_time error")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("auto_"))
-def cb_auto_set(callback_query: types.CallbackQuery):
+async def cb_auto_set(callback_query: types.CallbackQuery):
     try:
         val = int(callback_query.data.split("_",1)[1])
         key = str(callback_query.from_user.id)
@@ -737,7 +737,7 @@ def cb_auto_set(callback_query: types.CallbackQuery):
         logger.exception("cb_auto_set error")
 
 @dp.callback_query_handler(lambda c: c.data == 'price_confirm')
-def cb_price_confirm(callback_query: types.CallbackQuery):
+async def cb_price_confirm(callback_query: types.CallbackQuery):
     try:
         key = str(callback_query.from_user.id)
         if key not in pending_alerts:
@@ -749,13 +749,13 @@ def cb_price_confirm(callback_query: types.CallbackQuery):
         kb.row(InlineKeyboardButton("📈 Выше", callback_data="alert_type_above"),
                InlineKeyboardButton("📉 Ниже", callback_data="alert_type_below"),
                InlineKeyboardButton("🔄 Пересечение", callback_data="alert_type_cross"))
-        bot.send_message(callback_query.from_user.id, f"✅ Вы выбрали {a['coin']} при цене {a['price']}$.\nВыберите тип сигнала:", reply_markup=kb)
+        await bot.send_message(callback_query.from_user.id, f"✅ Вы выбрали {a['coin']} при цене {a['price']}$.\nВыберите тип сигнала:", reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_price_confirm error")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("alert_type_"))
-def cb_alert_type(callback_query: types.CallbackQuery):
+async def cb_alert_type(callback_query: types.CallbackQuery):
     try:
         typ = callback_query.data.split("_",2)[2]
         key = str(callback_query.from_user.id)
@@ -765,13 +765,13 @@ def cb_alert_type(callback_query: types.CallbackQuery):
             kb = InlineKeyboardMarkup(row_width=2)
             kb.row(InlineKeyboardButton("☑️ Одноразовый", callback_data="alert_rec_no"),
                    InlineKeyboardButton("🔂 Постоянный", callback_data="alert_rec_yes"))
-            bot.send_message(callback_query.from_user.id, "Одноразовый или постоянный?", reply_markup=kb)
+            await bot.send_message(callback_query.from_user.id, "Одноразовый или постоянный?", reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_alert_type error")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("alert_rec_"))
-def cb_alert_recurring(callback_query: types.CallbackQuery):
+async def cb_alert_recurring(callback_query: types.CallbackQuery):
     try:
         rec = 1 if callback_query.data.endswith("yes") else 0
         key = str(callback_query.from_user.id)
@@ -782,13 +782,13 @@ def cb_alert_recurring(callback_query: types.CallbackQuery):
                    InlineKeyboardButton("📅 Задать часы", callback_data="time_custom"))
             kb.row(InlineKeyboardButton("♾️ Без ограничений", callback_data="time_none"),
                    InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-            bot.send_message(callback_query.from_user.id, "Ограничить сигнал по времени?", reply_markup=kb)
+            await bot.send_message(callback_query.from_user.id, "Ограничить сигнал по времени?", reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_alert_recurring error")
 
 @dp.callback_query_handler(lambda c: c.data == 'time_today')
-def cb_time_today(callback_query: types.CallbackQuery):
+async def cb_time_today(callback_query: types.CallbackQuery):
     try:
         key = str(callback_query.from_user.id)
         if key in pending_alerts:
@@ -797,46 +797,46 @@ def cb_time_today(callback_query: types.CallbackQuery):
             a = pending_alerts[key]
             ok = save_alert_to_db(callback_query.from_user.id, f"{a['symbol']}", a['price'], a.get("type_selected","cross"), a.get("recurring",0), a.get("active_until"), None, None)
             if ok:
-                bot.send_message(callback_query.from_user.id, f"✅ Alert добавлен: {a['symbol']} {a.get('type_selected','cross')} {a['price']}$ (до конца дня)")
+                await bot.send_message(callback_query.from_user.id, f"✅ Alert добавлен: {a['symbol']} {a.get('type_selected','cross')} {a['price']}$ (до конца дня)")
                 log_db("info", f"Alert saved for {callback_query.from_user.id} {a['symbol']} {a['price']}")
             else:
-                bot.send_message(callback_query.from_user.id, "Ошибка при сохранении алерта.")
+                await bot.send_message(callback_query.from_user.id, "Ошибка при сохранении алерта.")
             del pending_alerts[key]
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_time_today error")
 
 @dp.callback_query_handler(lambda c: c.data == 'time_none')
-def cb_time_none(callback_query: types.CallbackQuery):
+async def cb_time_none(callback_query: types.CallbackQuery):
     try:
         key = str(callback_query.from_user.id)
         if key in pending_alerts:
             a = pending_alerts[key]
             ok = save_alert_to_db(callback_query.from_user.id, f"{a['symbol']}", a['price'], a.get("type_selected","cross"), a.get("recurring",0), None, None, None)
             if ok:
-                bot.send_message(callback_query.from_user.id, f"✅ Alert добавлен: {a['symbol']} {a.get('type_selected','cross')} {a['price']}$")
+                await bot.send_message(callback_query.from_user.id, f"✅ Alert добавлен: {a['symbol']} {a.get('type_selected','cross')} {a['price']}$")
                 log_db("info", f"Alert saved for {callback_query.from_user.id} {a['symbol']} {a['price']}")
             else:
-                bot.send_message(callback_query.from_user.id, "Ошибка при сохранении алерта.")
+                await bot.send_message(callback_query.from_user.id, "Ошибка при сохранении алерта.")
             del pending_alerts[key]
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_time_none error")
 
 @dp.callback_query_handler(lambda c: c.data == 'time_custom')
-def cb_time_custom(callback_query: types.CallbackQuery):
+async def cb_time_custom(callback_query: types.CallbackQuery):
     try:
         key = str(callback_query.from_user.id)
         if key in pending_alerts:
             pending_alerts[key]["awaiting_time"] = True
-            bot.send_message(callback_query.from_user.id, "Введите срок действия в часах (например: 24):")
+            await bot.send_message(callback_query.from_user.id, "Введите срок действия в часах (например: 24):")
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_time_custom error")
 
 # message handler for awaiting_time and awaiting_new_symbol (text messages)
 @dp.message_handler()
-def msg_text_handler(message: types.Message):
+async def msg_text_handler(message: types.Message):
     try:
         add_user(message.chat.id)
         key = str(message.chat.id)
@@ -849,15 +849,15 @@ def msg_text_handler(message: types.Message):
                 a["active_until"] = active_until
                 ok = save_alert_to_db(message.chat.id, f"{a['symbol']}", a['price'], a.get("type_selected","cross"), a.get("recurring",0), a.get("active_until"), None, None)
                 if ok:
-                    bot.send_message(message.chat.id, f"✅ Alert добавлен: {a['symbol']} {a.get('type_selected','cross')} {a['price']}$ (до {active_until})")
+                    await bot.send_message(message.chat.id, f"✅ Alert добавлен: {a['symbol']} {a.get('type_selected','cross')} {a['price']}$ (до {active_until})")
                     log_db("info", f"Alert saved for {message.chat.id} {a['symbol']} {a['price']}")
                 else:
-                    bot.send_message(message.chat.id, "Ошибка при сохранении алерта.")
+                    await bot.send_message(message.chat.id, "Ошибка при сохранении алерта.")
                 del pending_alerts[key]
             except Exception:
-                bot.send_message(message.chat.id, "Ошибка: введите целое число часов (например: 24).")
+                await bot.send_message(message.chat.id, "Ошибка: введите целое число часов (например: 24).")
             finally:
-                bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
+                await bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
             return
 
         # new symbol adding flow (if any)
@@ -870,14 +870,14 @@ def msg_text_handler(message: types.Message):
                 markets = exchange.load_markets()
                 if symbol in markets:
                     add_user_symbol(message.chat.id, symbol)
-                    bot.send_message(message.chat.id, f"✅ Монета {symbol} добавлена в ваш список.")
+                    await bot.send_message(message.chat.id, f"✅ Монета {symbol} добавлена в ваш список.")
                 else:
-                    bot.send_message(message.chat.id, f"❌ Пара {symbol} не найдена на MEXC.")
+                    await bot.send_message(message.chat.id, f"❌ Пара {symbol} не найдена на MEXC.")
             except Exception:
                 logger.exception("Error checking markets")
-                bot.send_message(message.chat.id, f"Ошибка при проверке {symbol}.")
+                await bot.send_message(message.chat.id, f"Ошибка при проверке {symbol}.")
             del pending_alerts[key]
-            bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
+            await bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
             return
 
         # fallback - other text commands: /price SYMBOL, /chart SYMBOL
@@ -889,10 +889,10 @@ def msg_text_handler(message: types.Message):
                 if "/" not in s:
                     s = s + "/USDT"
                 price = last_prices.get(s)
-                bot.send_message(message.chat.id, f"💰 {s}: {price if price is not None else 'n/a'}$")
+                await bot.send_message(message.chat.id, f"💰 {s}: {price if price is not None else 'n/a'}$")
             else:
-                bot.send_message(message.chat.id, "Использование: /price SYMBOL")
-            bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
+                await bot.send_message(message.chat.id, "Использование: /price SYMBOL")
+            await bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
             return
 
         if text.startswith("/chart"):
@@ -907,26 +907,26 @@ def msg_text_handler(message: types.Message):
                         buf.seek(0)
                         bot.send_photo(message.chat.id, ('chart.png', buf), caption=f"{s} — график")
                     except Exception:
-                        bot.send_message(message.chat.id, "Ошибка отправки графика")
+                        await bot.send_message(message.chat.id, "Ошибка отправки графика")
                 else:
-                    bot.send_message(message.chat.id, "Недостаточно данных или отсутствует библиотека графиков.")
+                    await bot.send_message(message.chat.id, "Недостаточно данных или отсутствует библиотека графиков.")
             else:
-                bot.send_message(message.chat.id, "Использование: /chart SYMBOL")
-            bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
+                await bot.send_message(message.chat.id, "Использование: /chart SYMBOL")
+            await bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
             return
 
-        # default menu
-        bot.send_message(message.chat.id, "Выберите действие:", reply_markup=main_menu_kb())
+        # async default menu
+        await bot.send_message(message.chat.id, "Выберите действие:", reply_markup=main_menu_kb())
     except Exception:
         logger.exception("msg_text_handler error")
 
 # My alerts list
 @dp.callback_query_handler(lambda c: c.data == 'my_alerts')
-def cb_my_alerts(callback_query: types.CallbackQuery):
+async def cb_my_alerts(callback_query: types.CallbackQuery):
     try:
         rows = list_user_alerts(callback_query.from_user.id)
         if not rows:
-            bot.send_message(callback_query.from_user.id, "У вас пока нет активных Alerts.", reply_markup=main_menu_kb())
+            await bot.send_message(callback_query.from_user.id, "У вас пока нет активных Alerts.", reply_markup=main_menu_kb())
             bot.answer_callback_query(callback_query.id)
             return
         kb = InlineKeyboardMarkup(row_width=1)
@@ -935,47 +935,47 @@ def cb_my_alerts(callback_query: types.CallbackQuery):
             label = ("🔂" if rec else "☑️") + f" {sym} {atype} {targ}$"
             kb.add(InlineKeyboardButton(label, callback_data=f"del_alert_{aid}"))
         kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        bot.send_message(callback_query.from_user.id, "Ваши Alerts (нажмите чтобы удалить):", reply_markup=kb)
+        await bot.send_message(callback_query.from_user.id, "Ваши Alerts (нажмите чтобы удалить):", reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_my_alerts error")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("del_alert_"))
-def cb_delete_alert(callback_query: types.CallbackQuery):
+async def cb_delete_alert(callback_query: types.CallbackQuery):
     try:
         aid = int(callback_query.data.split("_",2)[2])
         delete_alert(aid, callback_query.from_user.id)
-        bot.send_message(callback_query.from_user.id, "✅ Alert удалён.", reply_markup=main_menu_kb())
+        await bot.send_message(callback_query.from_user.id, "✅ Alert удалён.", reply_markup=main_menu_kb())
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_delete_alert error")
 
 # My symbols
 @dp.callback_query_handler(lambda c: c.data == 'my_symbols')
-def cb_my_symbols(callback_query: types.CallbackQuery):
+async def cb_my_symbols(callback_query: types.CallbackQuery):
     try:
         syms = get_user_symbols(callback_query.from_user.id)
         text = "Ваши монеты:\n" + "\n".join(syms)
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("➕ Добавить монету", callback_data="add_symbol"))
         kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        bot.send_message(callback_query.from_user.id, text, reply_markup=kb)
+        await bot.send_message(callback_query.from_user.id, text, reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_my_symbols error")
 
 @dp.callback_query_handler(lambda c: c.data == 'add_symbol')
-def cb_add_symbol(callback_query: types.CallbackQuery):
+async def cb_add_symbol(callback_query: types.CallbackQuery):
     try:
         pending_alerts[str(callback_query.from_user.id)] = {"awaiting_new_symbol": True}
-        bot.send_message(callback_query.from_user.id, "Введите символ монеты (например: ADA или ADA/USDT).")
+        await bot.send_message(callback_query.from_user.id, "Введите символ монеты (например: ADA или ADA/USDT).")
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_add_symbol error")
 
 # Settings (toggle signals)
 @dp.callback_query_handler(lambda c: c.data == 'settings')
-def cb_settings(callback_query: types.CallbackQuery):
+async def cb_settings(callback_query: types.CallbackQuery):
     try:
         cur.execute("SELECT signals_enabled FROM user_settings WHERE chat_id=?", (str(callback_query.from_user.id),))
         row = cur.fetchone()
@@ -983,13 +983,13 @@ def cb_settings(callback_query: types.CallbackQuery):
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("🔁 Авто-сигналы Вкл/Выкл", callback_data="toggle_signals"))
         kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        bot.send_message(callback_query.from_user.id, f"Авто-сигналы: {'Вкл' if cur_val==1 else 'Выкл'}", reply_markup=kb)
+        await bot.send_message(callback_query.from_user.id, f"Авто-сигналы: {'Вкл' if cur_val==1 else 'Выкл'}", reply_markup=kb)
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_settings error")
 
 @dp.callback_query_handler(lambda c: c.data == 'toggle_signals')
-def cb_toggle_signals(callback_query: types.CallbackQuery):
+async def cb_toggle_signals(callback_query: types.CallbackQuery):
     try:
         cur.execute("SELECT signals_enabled FROM user_settings WHERE chat_id=?", (str(callback_query.from_user.id),))
         row = cur.fetchone()
@@ -997,7 +997,7 @@ def cb_toggle_signals(callback_query: types.CallbackQuery):
         new_val = 0 if cur_val == 1 else 1
         cur.execute("INSERT OR REPLACE INTO user_settings (chat_id, signals_enabled) VALUES (?, ?)", (str(callback_query.from_user.id), new_val))
         conn.commit()
-        bot.send_message(callback_query.from_user.id, f"Авто-сигналы {'включены' if new_val==1 else 'выключены'}.")
+        await bot.send_message(callback_query.from_user.id, f"Авто-сигналы {'включены' if new_val==1 else 'выключены'}.")
         bot.answer_callback_query(callback_query.id)
     except Exception:
         logger.exception("cb_toggle_signals error")
@@ -1007,14 +1007,14 @@ def cb_toggle_signals(callback_query: types.CallbackQuery):
 price_thread_stop = threading.Event()
 price_thread = threading.Thread(target=price_polling_worker, args=(price_thread_stop,), daemon=True)
 
-def on_startup(dp: Dispatcher):
+async def on_startup(dp: Dispatcher):
     try:
         logger.info("Starting background price thread")
         price_thread.start()
     except Exception:
         logger.exception("on_startup error")
 
-def on_shutdown(dp: Dispatcher):
+async def on_shutdown(dp: Dispatcher):
     try:
         logger.info("Shutting down: stopping price thread")
         price_thread_stop.set()
@@ -1030,7 +1030,7 @@ def on_shutdown(dp: Dispatcher):
 # ---------- Main entry ----------
 if __name__ == '__main__':
     # Print small usage message
-    logger.info("Bot starting. Use TELEGRAM_TOKEN env var or token.txt. Polling mode by default.")
+    logger.info("Bot starting. Use TELEGRAM_TOKEN env var or token.txt. Polling mode by async default.")
     # Start long polling
     try:
         executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
@@ -1048,6 +1048,6 @@ if __name__ == "__main__":
 
 async def on_startup(dp):
     logging.info("Bot started")
-
+    
 async def on_shutdown(dp):
     logging.info("Bot stopped")
