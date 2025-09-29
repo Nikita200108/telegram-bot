@@ -13,5 +13,6 @@ gunicorn
 
 aiogram==2.25.1
 
+apscheduler==3.10.4
 
 
