@@ -1,20 +1,17 @@
-
-
-
-
-# --- Твой базовый набор ---
-ccxt>=4.3.0
-flask>=2.3.0
-pandas>=2.0.0
-matplotlib>=3.7.0
-numpy>=1.24.0
-python-dotenv>=1.0.0
-gunicorn>=21.2.0
-requests>=2.31.0
-
-# --- Для Telegram-бота ---
-aiogram==2.25.1
-aiohttp>=3.8.0,<3.9.0
-
-uvicorn
+     # или подходящая 3.x версия, проверь совместимость
+fastapi
+uvicorn[standard]
 aiosqlite
+ccxt
+pandas
+numpy
+matplotlib
+mplfinance
+python-dotenv
+requests
+gunicorn
+
+aiogram==2.25.1
+
+
+
