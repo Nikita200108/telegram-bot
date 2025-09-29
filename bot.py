@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Crypto Bot (aiogram v2.25.1)
-Features:
-- aiogram v2 handlers, inline keyboards
-- SQLite persistence (users, user_symbols, alerts, history, logs)
-- Background price polling (ccxt.MEXC) in separate thread
-- Alerts: above/below/cross, recurring or one-time, time limits
-- Inline UI to add alerts, choose symbols, quick price list, charts
-- Chart generation (matplotlib / mplfinance) if available; fails gracefully if libs missing
-- Logging (console + DB). Errors don't crash the bot; they are logged.
-- Token is read from env TELEGRAM_TOKEN or token.txt; in interactive mode -- prompts and saves.
-- Can run in Railway using polling (recommended) or switch to webhook mode by configuring USE_WEBHOOK env var.
+Telegram Crypto Bot (aiogram v2.x)
+- polling / webhook modes
+- MEXC prices via ccxt (sync version executed in executor)
+- SQLite persistence (users, symbols, alerts, history, logs, settings)
+- Inline button UI for all flows
+- Background price poller, alert checker
+- Chart generation (matplotlib) in threadpool
+- Robust logging: errors don't crash the process
 """
 
 import os
@@ -19,384 +16,484 @@ import sys
 import time
 import json
 import math
-import threading
-import logging
 import sqlite3
+import logging
+import inspect
 import traceback
+import asyncio
+import concurrent.futures
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
-from typing import Optional, List, Tuple
-
-# ---------- Third-party libs ----------
-# Make sure to install matching versions:
-# pip install aiogram==2.25.1 ccxt flask pandas matplotlib numpy python-dotenv mplfinance
-try:
-    from aiogram import Bot, types
-    from aiogram.dispatcher import Dispatcher
-    from aiogram.utils import executor
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-except Exception as e:
-    print("aiogram import failed. Make sure aiogram==2.25.1 is installed.")
-    raise
+from typing import Optional, List, Dict, Any, Tuple
 
 import requests
-import ccxt
-# optional libs
-try:
-    import pandas as pd
-except Exception:
-    pd = None
-try:
-    import matplotlib.pyplot as plt
-except Exception:
-    plt = None
+import ccxt  # sync ccxt - using run_in_executor to avoid blocking
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+# optional: mplfinance for candlesticks (if installed)
 try:
     import mplfinance as mpf
+    HAS_MPLFINANCE = True
 except Exception:
-    mpf = None
-import numpy as np
+    HAS_MPLFINANCE = False
 
-# ---------- Configuration ----------
-# async defaults
-DB_PATH = os.getenv("DB_PATH", "bot_data.sqlite")
-PRICE_POLL_INTERVAL = int(os.getenv("PRICE_POLL_INTERVAL", "5"))  # seconds
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "1000"))
-defAULT_SYMBOLS = os.getenv("async defAULT_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,NEAR/USDT").split(",")
-PRICE_FETCH_TIMEOUT = float(os.getenv("PRICE_FETCH_TIMEOUT", "5.0"))
-USE_WEBHOOK = os.getenv("USE_WEBHOOK", "").lower() in ("1", "true", "yes")
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ---------------- Config & Logging ----------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger("crypto_bot")
 
-# ---------- Token handling ----------
-def load_token() -> Optional[str]:
-    """Load TELEGRAM_TOKEN from env or token.txt; if interactive, ask and save."""
+# ThreadPool for blocking tasks
+EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+
+# ---------------- Token loading ----------------
+def load_token_interactive_or_file() -> Optional[str]:
+    """
+    Load Telegram token from environment, token.txt or (if interactive) ask user.
+    If running in non-interactive environment (Railway), don't prompt.
+    """
     token = os.getenv("TELEGRAM_TOKEN")
     if token:
         logger.info("TELEGRAM_TOKEN loaded from environment.")
         return token.strip()
-
     # try token.txt
-    if os.path.exists("token.txt"):
+    token_path = os.path.join(os.getcwd(), "token.txt")
+    if os.path.exists(token_path):
         try:
-            with open("token.txt", "r", encoding="utf-8") as f:
+            with open(token_path, "r", encoding="utf-8") as f:
                 t = f.read().strip()
                 if t:
                     logger.info("TELEGRAM_TOKEN loaded from token.txt.")
                     return t
-        except Exception:
-            logger.exception("Failed reading token.txt")
-
-    # if interactive, prompt and save
-    try:
-        if sys.stdin and sys.stdin.isatty():
+        except Exception as e:
+            logger.exception("Failed reading token.txt: %s", e)
+    # interactive prompt if attached to tty
+    if sys.stdin and sys.stdin.isatty():
+        try:
             t = input("Введите TELEGRAM_TOKEN (BotFather): ").strip()
             if t:
+                # save to token.txt for convenience
                 try:
-                    with open("token.txt", "w", encoding="utf-8") as f:
+                    with open(token_path, "w", encoding="utf-8") as f:
                         f.write(t)
-                    logger.info("Token saved to token.txt")
+                        logger.info("Token saved to token.txt")
                 except Exception:
                     logger.exception("Failed to save token to token.txt")
                 return t
-    except Exception:
-        logger.info("Not interactive or input failed; TELEGRAM_TOKEN not set.")
-
+        except Exception as e:
+            logger.exception("Interactive token input failed: %s", e)
+    # nothing found
+    logger.error("TELEGRAM_TOKEN not found. Set TELEGRAM_TOKEN env var or token.txt, or run interactively.")
     return None
 
-TELEGRAM_TOKEN = load_token()
+TELEGRAM_TOKEN = load_token_interactive_or_file()
 if not TELEGRAM_TOKEN:
-    logger.critical("TELEGRAM_TOKEN not found. Set TELEGRAM_TOKEN as env var or put token in token.txt.")
-    # Exit because bot cannot run without token in non-interactive environment
-    # If you want to continue without token (for static checks), comment the next line.
+    # fatal for bot to run; but we avoid raising raw exception to let logs be clean
+    logger.critical("Token is missing. Exiting.")
     sys.exit(1)
 
-# ---------- Create bot + dispatcher ----------
-bot = Bot(token=TELEGRAM_TOKEN)
+MODE = os.getenv("MODE", "polling").lower()  # 'polling' or 'webhook'
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # required for webhook mode
+
+# ---------------- Globals and DB ----------------
+DB_PATH = os.getenv("DB_PATH", "bot_data.sqlite")
+PRICE_POLL_INTERVAL = int(os.getenv("PRICE_POLL_INTERVAL", "5"))  # seconds (can be fractional)
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "1000"))
+
+# default symbols
+DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "NEAR/USDT"]
+
+# price steps for UI
+PRICE_STEPS = [-10000, -5000, -1000, -100, -10, -1, 1, 10, 100, 1000, 5000, 10000]
+
+# create Bot & Dispatcher
+bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
-# ---------- Exchange (synchronous ccxt used in background thread) ----------
-try:
-    exchange = ccxt.mexc({"enableRateLimit": True})
-    logger.info("Initialized ccxt mexc exchange")
-except Exception as e:
-    logger.exception("Failed to initialize ccxt mexc.")
-    exchange = None
+# connection will be created in async init
+_conn: Optional[sqlite3.Connection] = None
+_db_lock = asyncio.Lock()
 
-# ---------- Database (SQLite) ----------
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cur = conn.cursor()
+def db_conn() -> sqlite3.Connection:
+    global _conn
+    if _conn is None:
+        # fallback synchronous open (should not happen if init_db called)
+        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return _conn
+
+# ---------------- Database initialization ----------------
+def _create_tables_sync():
+    """Synchronous table creation executed inside thread."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        chat_id TEXT PRIMARY KEY,
+        created_at DATETIME
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_symbols (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT,
+        symbol TEXT
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT,
+        symbol TEXT,
+        target REAL,
+        alert_type TEXT DEFAULT 'cross',
+        is_recurring INTEGER DEFAULT 0,
+        active_until TEXT DEFAULT NULL,
+        time_start TEXT DEFAULT NULL,
+        time_end TEXT DEFAULT NULL
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        price REAL,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        level TEXT,
+        message TEXT,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_settings (
+        chat_id TEXT PRIMARY KEY,
+        signals_enabled INTEGER DEFAULT 0
+    )""")
+    conn.commit()
+    conn.close()
 
 async def init_db():
+    """Initialize DB (to be awaited at startup)."""
     try:
-        cur.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id TEXT PRIMARY KEY,
-            created_at DATETIME
-        );
-        CREATE TABLE IF NOT EXISTS user_symbols (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT,
-            symbol TEXT
-        );
-        CREATE TABLE IF NOT EXISTS alerts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT,
-            symbol TEXT,
-            target REAL,
-            alert_type TEXT async defAULT 'cross',
-            is_recurring INTEGER async defAULT 0,
-            active_until TEXT async defAULT NULL,
-            time_start TEXT async defAULT NULL,
-            time_end TEXT async defAULT NULL,
-            created_at DATETIME async defAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            price REAL,
-            ts DATETIME async defAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            level TEXT,
-            message TEXT,
-            ts DATETIME async defAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS user_settings (
-            chat_id TEXT PRIMARY KEY,
-            signals_enabled INTEGER async defAULT 0
-        );
-        """)
-        conn.commit()
+        logger.info("Initializing DB at %s", DB_PATH)
+        await asyncio.get_event_loop().run_in_executor(EXECUTOR, _create_tables_sync)
+        # open main connection for fast operations in thread-safe mode
+        global _conn
+        if _conn is None:
+            _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            _conn.execute("PRAGMA journal_mode=WAL;")
+            _conn.execute("PRAGMA synchronous=NORMAL;")
         logger.info("DB initialized at %s", DB_PATH)
     except Exception:
-        logger.exception("DB init error")
+        logger.exception("init_db failed")
 
-init_db()
+# ---------------- DB helper wrappers (run in executor) ----------------
+def _db_execute(query: str, params: tuple = ()):
+    """Run SQL synchronously in threadpool."""
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute(query, params)
+        conn.commit()
+        return cur
+    except Exception:
+        logger.exception("DB exec error: %s params: %s", query, params)
+        raise
 
-# ---------- Logging helper (store in DB + logger) ----------
+async def db_execute(query: str, params: tuple = ()):
+    return await asyncio.get_event_loop().run_in_executor(EXECUTOR, _db_execute, query, params)
+
+async def db_fetchall(query: str, params: tuple = ()):
+    def _(): 
+        cur = _db_execute(query, params)
+        return cur.fetchall()
+    return await asyncio.get_event_loop().run_in_executor(EXECUTOR, _)
+
+async def db_fetchone(query: str, params: tuple = ()):
+    def _():
+        cur = _db_execute(query, params)
+        return cur.fetchone()
+    return await asyncio.get_event_loop().run_in_executor(EXECUTOR, _)
+
 async def log_db(level: str, message: str):
     try:
-        cur.execute("INSERT INTO logs (level, message) VALUES (?, ?)", (level.upper(), message))
-        conn.commit()
+        await db_execute("INSERT INTO logs (level, message) VALUES (?, ?)", (level.upper(), message))
+        getattr(logger, level.lower(), logger.info)(message)
     except Exception:
-        logger.exception("Failed to insert log into DB")
-    # console
-    getattr(logger, level.lower(), logger.info)(message)
+        logger.exception("log_db failed")
 
-# ---------- In-memory runtime structures ----------
-pending_alerts = {}  # chat_id -> dict for flows
-last_prices = {}     # symbol -> price
-history_cache = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
+# -------------- Exchange (ccxt) utils --------------
+exchange = ccxt.mexc({'enableRateLimit': True})
 
-# ---------- DB wrappers ----------
+async def fetch_ticker_async(symbol: str) -> Optional[float]:
+    """Fetch ticker via ccxt in threadpool to avoid blocking event loop."""
+    loop = asyncio.get_event_loop()
+    try:
+        def _fetch():
+            try:
+                t = exchange.fetch_ticker(symbol)
+                return float(t.get("last") or t.get("close") or 0.0)
+            except Exception as e:
+                # if pair not found, return None
+                raise e
+        price = await loop.run_in_executor(EXECUTOR, _fetch)
+        return price
+    except Exception as e:
+        logger.debug("fetch_ticker_async error for %s: %s", symbol, e)
+        return None
+
+async def fetch_ohlcv_async(symbol: str, timeframe: str = "1m", limit: int = 200):
+    loop = asyncio.get_event_loop()
+    try:
+        def _fetch():
+            try:
+                return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            except Exception as e:
+                raise e
+        data = await loop.run_in_executor(EXECUTOR, _fetch)
+        return data
+    except Exception as e:
+        logger.debug("fetch_ohlcv_async error %s %s: %s", symbol, timeframe, e)
+        return None
+
+# -------------- In-memory runtime --------------
+pending_alerts: Dict[str, dict] = {}
+last_prices: Dict[str, float] = {}
+history_cache: Dict[str, deque] = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
+
+# -------------- Helper: users & symbols --------------
 async def add_user(chat_id: int):
     try:
-        cur.execute("INSERT OR IGNORE INTO users (chat_id, created_at) VALUES (?, ?)", (str(chat_id), datetime.utcnow()))
-        conn.commit()
+        await db_execute("INSERT OR IGNORE INTO users (chat_id, created_at) VALUES (?, ?)", (str(chat_id), datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
     except Exception:
         logger.exception("add_user error")
 
 async def get_user_symbols(chat_id: int) -> List[str]:
-    try:
-        cur.execute("SELECT symbol FROM user_symbols WHERE chat_id=?", (str(chat_id),))
-        rows = cur.fetchall()
-        if rows:
-            return [r[0] for r in rows]
-    except Exception:
-        logger.exception("get_user_symbols error")
-    return  defAULT_SYMBOLS.copy()
+    rows = await db_fetchall("SELECT symbol FROM user_symbols WHERE chat_id=?", (str(chat_id),))
+    if rows:
+        return [r[0] for r in rows]
+    return DEFAULT_SYMBOLS.copy()
 
 async def add_user_symbol(chat_id: int, symbol: str) -> bool:
     try:
-        cur.execute("INSERT INTO user_symbols (chat_id, symbol) VALUES (?, ?)", (str(chat_id), symbol))
-        conn.commit()
+        await db_execute("INSERT INTO user_symbols (chat_id, symbol) VALUES (?, ?)", (str(chat_id), symbol))
         return True
     except Exception:
         logger.exception("add_user_symbol error")
         return False
 
-async def list_user_alerts(chat_id: int):
+# -------------- Alerts storage --------------
+async def save_alert_to_db(chat_id: int, symbol: str, target: float, alert_type: str = "cross", is_recurring: int = 0, active_until: Optional[str] = None, time_start: Optional[str] = None, time_end: Optional[str] = None):
     try:
-        cur.execute("SELECT id, symbol, target, alert_type, is_recurring, active_until FROM alerts WHERE chat_id=? ORDER BY id DESC", (str(chat_id),))
-        return cur.fetchall()
-    except Exception:
-        logger.exception("list_user_alerts error")
-        return []
-
-async def delete_alert(alert_id: int, chat_id: int):
-    try:
-        cur.execute("DELETE FROM alerts WHERE id=? AND chat_id=?", (int(alert_id), str(chat_id)))
-        conn.commit()
-    except Exception:
-        logger.exception("delete_alert error")
-
-async def save_alert_to_db(chat_id: int, symbol: str, target: float, alert_type='cross', is_recurring=0, active_until=None, time_start=None, time_end=None):
-    try:
-        cur.execute(
+        await db_execute(
             "INSERT INTO alerts (chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (str(chat_id), symbol, float(target), alert_type, int(is_recurring), active_until, time_start, time_end)
         )
-        conn.commit()
+        await log_db("info", f"Alert saved: {chat_id} {symbol} {alert_type} {target}")
         return True
     except Exception:
         logger.exception("save_alert_to_db error")
         return False
 
-async def get_all_alerts():
+async def list_user_alerts(chat_id: int):
+    rows = await db_fetchall("SELECT id, symbol, target, alert_type, is_recurring, active_until FROM alerts WHERE chat_id=? ORDER BY id DESC", (str(chat_id),))
+    return rows
+
+async def delete_alert(alert_id: int, chat_id: int):
     try:
-        cur.execute("SELECT id, chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end FROM alerts")
-        return cur.fetchall()
+        await db_execute("DELETE FROM alerts WHERE id=? AND chat_id=?", (int(alert_id), str(chat_id)))
+        await log_db("info", f"Alert deleted: {alert_id} by {chat_id}")
+        return True
     except Exception:
-        logger.exception("get_all_alerts error")
-        return []
+        logger.exception("delete_alert error")
+        return False
 
-# ---------- Telegram UI helpers ----------
-async def main_menu_kb():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(InlineKeyboardButton("💰 Все цены", callback_data="price_all"),
-           InlineKeyboardButton("📊 График", callback_data="chart_menu"))
-    kb.add(InlineKeyboardButton("🔔 Добавить Alert", callback_data="add_alert"),
-           InlineKeyboardButton("📋 Мои Alerts", callback_data="my_alerts"))
-    kb.add(InlineKeyboardButton("⚙️ Мои монеты", callback_data="my_symbols"),
-           InlineKeyboardButton("⚙️ Настройки", callback_data="settings"))
-    return kb
+async def get_all_alerts():
+    rows = await db_fetchall("SELECT id, chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end FROM alerts")
+    return rows
 
-async def price_menu_kb(symbols: List[str]):
-    kb = InlineKeyboardMarkup(row_width=3)
-    for s in symbols:
-        kb.insert(InlineKeyboardButton(s.split("/")[0], callback_data=f"price_{s.split('/')[0]}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-    return kb
-
-async def symbols_keyboard(symbols: List[str], prefix: str, per_row=3):
-    kb = InlineKeyboardMarkup(row_width=per_row)
-    for s in symbols:
-        kb.insert(InlineKeyboardButton(s.split("/")[0], callback_data=f"{prefix}_{s.split('/')[0]}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-    return kb
-
-async def price_steps_kb(include_confirm=True):
-    steps = [-10000, -5000, -1000, -100, -10, -1, 1, 10, 100, 1000, 5000, 10000]
-    kb = InlineKeyboardMarkup(row_width=6)
-    # show sign-less labels for negative rows
-    neg = [str(s) for s in steps[:6]]
-    pos = [f"+{s}" for s in steps[6:]]
-    for s in neg:
-        kb.insert(InlineKeyboardButton(s, callback_data=f"step_{s}"))
-    for s in pos:
-        kb.insert(InlineKeyboardButton(s, callback_data=f"step_{s.replace('+','')}"))
-    if include_confirm:
-        kb.add(InlineKeyboardButton("✅ Готово", callback_data="price_confirm"))
-    kb.add(InlineKeyboardButton("⏱ Автоподтв.", callback_data="auto_time"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-    return kb
-
-async def autotime_kb():
-    kb = InlineKeyboardMarkup(row_width=3)
-    kb.row(InlineKeyboardButton("5s", callback_data="auto_5"),
-           InlineKeyboardButton("10s", callback_data="auto_10"),
-           InlineKeyboardButton("30s", callback_data="auto_30"))
-    kb.row(InlineKeyboardButton("Откл", callback_data="auto_0"),
-           InlineKeyboardButton("⬅️ Назад", callback_data="price_steps_back"))
-    return kb
-
-# ---------- Price fetching logic (background thread) ----------
-async def fetch_price_for_symbol(symbol: str) -> Optional[float]:
-    """Synchronous fetch from ccxt mexc. Returns last price or None."""
-    if not exchange:
-        return None
+# -------------- History saving --------------
+async def save_history_point(symbol: str, price: float):
     try:
-        ticker = exchange.fetch_ticker(symbol)
-        price = ticker.get("last") or ticker.get("close")
-        if price is None:
-            return None
-        return float(price)
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        await db_execute("INSERT INTO history (symbol, price, ts) VALUES (?, ?, ?)", (symbol, price, ts))
+        history_cache[symbol].append((ts, price))
+    except Exception:
+        logger.exception("save_history_point error")
+
+# -------------- Charting (in threadpool) --------------
+def _build_line_chart_image_sync(symbol: str, points: int = 80, sma_list: List[int] = None, ema_list: List[int] = None, show_rsi: bool = False, show_macd: bool = False):
+    try:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute("SELECT ts, price FROM history WHERE symbol=? ORDER BY id DESC LIMIT ?", (symbol, points))
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            raise ValueError("not enough history")
+        rows = rows[::-1]
+        times = [datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S") for r in rows]
+        prices = [r[1] for r in rows]
+        df = pd.DataFrame({"time": times, "price": prices}).set_index("time")
+        fig = None
+        if show_rsi or show_macd:
+            n_sub = 1 + (1 if show_rsi else 0) + (1 if show_macd else 0)
+            fig, axes = plt.subplots(n_sub, 1, figsize=(10, 3*n_sub), sharex=True)
+            if n_sub == 1:
+                axes = [axes]
+            ax_price = axes[0]
+            ax_price.plot(df.index, df["price"], label="Price")
+            if sma_list:
+                for s in sma_list:
+                    df[f"SMA{s}"] = df["price"].rolling(window=s).mean()
+                    ax_price.plot(df.index, df[f"SMA{s}"], label=f"SMA{s}")
+            if ema_list:
+                for e in ema_list:
+                    df[f"EMA{e}"] = df["price"].ewm(span=e, adjust=False).mean()
+                    ax_price.plot(df.index, df[f"EMA{e}"], label=f"EMA{e}")
+            ax_price.legend(); ax_price.grid(True)
+            idx = 1
+            if show_rsi:
+                # simple RSI
+                delta = pd.Series(prices).diff().dropna()
+                up = delta.clip(lower=0).rolling(window=14).mean()
+                down = (-delta.clip(upper=0)).rolling(window=14).mean()
+                rs = up / (down.replace(0, np.nan))
+                rsi = 100 - 100 / (1 + rs)
+                axes[idx].plot(df.index[1:], rsi, label="RSI")
+                axes[idx].axhline(70, linestyle="--")
+                axes[idx].axhline(30, linestyle="--")
+                axes[idx].set_ylim(0, 100)
+                idx += 1
+            if show_macd:
+                s = pd.Series(prices)
+                ema_fast = s.ewm(span=12, adjust=False).mean()
+                ema_slow = s.ewm(span=26, adjust=False).mean()
+                macd_line = ema_fast - ema_slow
+                signal_line = macd_line.ewm(span=9, adjust=False).mean()
+                axes[idx].plot(df.index, macd_line, label="MACD")
+                axes[idx].plot(df.index, signal_line, label="Signal")
+                axes[idx].legend()
+        else:
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(df.index, df["price"], label="Price")
+            if sma_list:
+                for s in sma_list:
+                    df[f"SMA{s}"] = df["price"].rolling(window=s).mean()
+                    ax.plot(df.index, df[f"SMA{s}"], label=f"SMA{s}")
+            if ema_list:
+                for e in ema_list:
+                    df[f"EMA{e}"] = df["price"].ewm(span=e, adjust=False).mean()
+                    ax.plot(df.index, df[f"EMA{e}"], label=f"EMA{e}")
+            ax.legend(); ax.grid(True)
+        import io
+        buf = io.BytesIO()
+        plt.tight_layout()
+        fig.savefig(buf, format="png", dpi=150)
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
     except Exception as e:
-        logger.debug("fetch error %s: %s", symbol, str(e))
+        logger.exception("chart generation sync error")
+        raise
+
+def _build_candlestick_chart_sync(symbol: str, timeframe: str = "1m", points: int = 200):
+    """
+    Build candlestick chart using OHLCV via ccxt (synchronous). Returns bytes.
+    Uses mplfinance if available, else draws simplified candlesticks.
+    """
+    try:
+        # fetch OHLCV sync (we'll use global exchange - blocking)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=points)
+        if not ohlcv:
+            raise ValueError("no ohlcv")
+        # ohlcv: [ [ts, open, high, low, close, volume], ... ]
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit='ms')
+        df = df.set_index("ts")
+        if HAS_MPLFINANCE:
+            import io
+            buf = io.BytesIO()
+            mpf.plot(df, type='candle', style='charles', volume=True, savefig=buf, tight_layout=True)
+            buf.seek(0)
+            return buf.read()
+        else:
+            # fallback simple candles
+            import matplotlib.dates as mdates
+            import io
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.plot(df.index, df["close"], label="Close")
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+            ax.grid(True)
+            plt.xticks(rotation=30)
+            buf = io.BytesIO()
+            plt.tight_layout()
+            fig.savefig(buf, format="png", dpi=150)
+            plt.close(fig)
+            buf.seek(0)
+            return buf.read()
+    except Exception:
+        logger.exception("candlestick generation error")
+        raise
+
+async def build_line_chart_image(symbol: str, points: int = 80, sma_list=None, ema_list=None, show_rsi=False, show_macd=False):
+    loop = asyncio.get_event_loop()
+    try:
+        data = await loop.run_in_executor(EXECUTOR, _build_line_chart_image_sync, symbol, points, sma_list, ema_list, show_rsi, show_macd)
+        return data
+    except Exception as e:
+        logger.exception("build_line_chart_image failed for %s", symbol)
         return None
 
-async def price_polling_worker(stop_event: threading.Event):
-    """Background thread that polls prices, saves to DB, checks alerts."""
-    logger.info("Price polling worker started, interval %s sec", PRICE_POLL_INTERVAL)
-    while not stop_event.is_set():
-        try:
-            # build symbols list from DB + async defaults
-            try:
-                cur.execute("SELECT DISTINCT symbol FROM user_symbols")
-                rows = cur.fetchall()
-                symbols = set( defAULT_SYMBOLS)
-                symbols.update(r[0] for r in rows)
-            except Exception:
-                logger.exception("Error building symbol list")
-                symbols = set( defAULT_SYMBOLS)
+async def build_candlestick_chart(symbol: str, timeframe: str = "1m", points: int = 200):
+    loop = asyncio.get_event_loop()
+    try:
+        data = await loop.run_in_executor(EXECUTOR, _build_candlestick_chart_sync, symbol, timeframe, points)
+        return data
+    except Exception:
+        logger.exception("build_candlestick_chart failed for %s %s", symbol, timeframe)
+        return None
 
-            for sym in list(symbols):
-                try:
-                    price = fetch_price_for_symbol(sym)
-                    if price is None:
-                        continue
-                    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                    last_prices[sym] = price
-                    # insert history
-                    try:
-                        cur.execute("INSERT INTO history (symbol, price, ts) VALUES (?, ?, ?)", (sym, price, ts))
-                        conn.commit()
-                        history_cache[sym].append((ts, price))
-                    except Exception:
-                        logger.exception("history insert error for %s", sym)
-                except Exception:
-                    logger.exception("fetch loop inner error for %s", sym)
-            # check alerts (synchronously)
-            try:
-                check_alerts()
-            except Exception:
-                logger.exception("check_alerts error")
-        except Exception:
-            logger.exception("price_polling_worker top error")
-        # sleep
-        stop_event.wait(PRICE_POLL_INTERVAL)
-    logger.info("Price polling worker stopping")
-
-# ---------- Alert checking (uses last_prices and history_cache) ----------
-async def is_within_time_window(time_start: Optional[str], time_end: Optional[str]) -> bool:
+# -------------- Alert checking --------------
+def _is_within_time_window(time_start: Optional[str], time_end: Optional[str]) -> bool:
     if not time_start or not time_end:
         return True
     now = datetime.utcnow().strftime("%H:%M")
-    try:
-        return time_start <= now <= time_end
-    except Exception:
-        return True
+    return time_start <= now <= time_end
 
 async def check_alerts():
-    """Checks DB alerts against last_prices/history and sends messages via bot (from background thread)."""
-    alerts = get_all_alerts()
-    for alert in alerts:
-        alert_id, chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end = alert
-        # expiry
-        if active_until:
-            try:
-                ru = datetime.strptime(active_until, "%Y-%m-%d %H:%M:%S")
-                if datetime.utcnow() > ru:
-                    cur.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
-                    conn.commit()
+    try:
+        alerts = await get_all_alerts()
+        for alert in alerts:
+            alert_id, chat_id, symbol, target, alert_type, is_recurring, active_until, time_start, time_end = alert
+            # expiration
+            if active_until:
+                try:
+                    ru = datetime.strptime(active_until, "%Y-%m-%d %H:%M:%S")
+                    if datetime.utcnow() > ru:
+                        await db_execute("DELETE FROM alerts WHERE id=?", (alert_id,))
+                        continue
+                except Exception:
+                    pass
+            if time_start and time_end:
+                if not _is_within_time_window(time_start, time_end):
                     continue
-            except Exception:
-                pass
-        if time_start and time_end:
-            if not is_within_time_window(time_start, time_end):
+            cur_price = last_prices.get(symbol)
+            if cur_price is None:
                 continue
-        cur_price = last_prices.get(symbol)
-        if cur_price is None:
-            continue
-        prev_price = None
-        hist = list(history_cache.get(symbol, []))
-        if len(hist) >= 2:
-            prev_price = hist[-2][1]
-        triggered = False
-        try:
+            prev_price = None
+            hist = history_cache.get(symbol, [])
+            if len(hist) >= 2:
+                prev_price = hist[-2][1]
+            triggered = False
             if alert_type == "above":
                 if cur_price > target:
                     triggered = True
@@ -407,481 +504,414 @@ async def check_alerts():
                 if prev_price is not None:
                     if (prev_price < target <= cur_price) or (prev_price > target >= cur_price):
                         triggered = True
-        except Exception:
-            logger.exception("alert eval error for id %s", alert_id)
-        if triggered:
-            # send message via bot in asyncio loop
-            text = f"🔔 Alert сработал: {symbol} {alert_type} {target}$ (текущая {cur_price}$)"
-            try:
-                # schedule coroutine from thread
-                loop = dp.loop
-                if loop and loop.is_running():
-                    loop.call_soon_threadsafe(lambda: dp.loop.create_task( bot.send_message(chat_id, text)))
-                else:
-                    logger.warning("Event loop not running, cannot send alert to %s", chat_id)
-                log_db("info", f"Alert fired for {chat_id} {symbol} {alert_type} {target}")
-            except Exception:
-                logger.exception("Failed to schedule alert message")
-            # delete one-time
-            if not is_recurring:
+            if triggered:
                 try:
-                    cur.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
-                    conn.commit()
+                    text = f"🔔 Alert сработал: {symbol} {alert_type} {target}$ (текущая {cur_price}$)"
+                    await bot.send_message(chat_id, text)
+                    await log_db("info", f"Alert fired for {chat_id} {symbol} {alert_type} {target}")
                 except Exception:
-                    logger.exception("Failed to delete one-time alert %s", alert_id)
+                    logger.exception("Failed to send alert to %s", chat_id)
+                if not is_recurring:
+                    await db_execute("DELETE FROM alerts WHERE id=?", (alert_id,))
+    except Exception:
+        logger.exception("check_alerts error")
 
-# ---------- Chart generation ----------
-async def build_candlestick_chart(symbol: str, timeframe: str = "1m", points: int = 200):
+# -------------- Price poller --------------
+async def price_polling_worker(stop_event: asyncio.Event):
     """
-    Build candlestick chart using history DB or last_prices.
-    timeframe not used to fetch new data here; assumes history has sufficiently frequent rows.
-    Returns bytes-like object or None.
+    Background worker that fetches prices for all symbols of interest and saves history.
+    stop_event used to gracefully stop the loop.
     """
-    # prefer history DB
-    try:
-        cur.execute("SELECT ts, price FROM history WHERE symbol=? ORDER BY id DESC LIMIT ?", (symbol, points*10))
-        rows = cur.fetchall()
-        if not rows:
-            return None
-        # rows are newest first; reverse
-        rows = rows[::-1]
-        # We only have price per time point; for candles need OHLC.
-        # We'll convert sequential points into candles of requested timeframe using pandas if available.
-        if pd is None or mpf is None:
-            # fallback: simple line chart with matplotlib
-            if plt is None:
-                logger.warning("No plotting libs available")
-                return None
-            times = [datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S") for r in rows]
-            prices = [r[1] for r in rows]
-            import io
-            fig, ax = plt.subplots(figsize=(10,4))
-            ax.plot(times, prices)
-            ax.set_title(symbol)
-            ax.grid(True)
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=120)
-            plt.close(fig)
-            buf.seek(0)
-            return buf
-        # build DataFrame with timestamp index
-        times = [datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S") for r in rows]
-        prices = [r[1] for r in rows]
-        df = pd.DataFrame({"price": prices}, index=pd.DatetimeIndex(times))
-        # resample to desired candle timeframe using 'timeframe' parameter mapping
-        # user requested timeframe as '1m','5m','15m','30m','1h','4h','1d'
-        tf_map = {"1m":"1T","5m":"5T","15m":"15T","30m":"30T","1h":"1H","4h":"4H","1d":"1D"}
-        rule = tf_map.get(timeframe, "1T")
-        ohlc = df["price"].resample(rule).ohlc()
-        ohlc.dropna(inplace=True)
-        if ohlc.empty:
-            return None
-        # use mplfinance to plot candlestick
-        import io
-        fig_buf = io.BytesIO()
+    logger.info("Price polling worker started, interval %s sec", PRICE_POLL_INTERVAL)
+    while not stop_event.is_set():
         try:
-            mpf.plot(ohlc, type='candle', style='yahoo', volume=False, savefig=dict(fname=fig_buf, dpi=120, bbox_inches='tight'))
-            fig_buf.seek(0)
-            return fig_buf
+            # determine full symbol set
+            rows = await db_fetchall("SELECT DISTINCT symbol FROM user_symbols")
+            symbols = set(DEFAULT_SYMBOLS)
+            for r in rows:
+                symbols.add(r[0])
+            # fetch each ticker
+            coros = [fetch_ticker_async(sym) for sym in symbols]
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            for sym, res in zip(list(symbols), results):
+                try:
+                    if isinstance(res, Exception):
+                        logger.debug("Error fetching %s: %s", sym, res)
+                        continue
+                    price = float(res) if res is not None else None
+                    if price is not None and price > 0:
+                        last_prices[sym] = price
+                        await save_history_point(sym, price)
+                        # keep history_cache updated
+                        history_cache[sym].append((datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), price))
+                except Exception:
+                    logger.exception("price polling per-symbol error %s", sym)
+            # check alerts
+            await check_alerts()
         except Exception:
-            # fallback to matplotlib line chart
-            fig, ax = plt.subplots(figsize=(10,4))
-            ax.plot(ohlc.index, ohlc['close'])
-            ax.set_title(f"{symbol} {timeframe}")
-            ax.grid(True)
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=120)
-            plt.close(fig)
-            buf.seek(0)
-            return buf
-    except Exception:
-        logger.exception("build_candlestick_chart error")
-        return None
-
-# ---------- Bot handlers: commands + callbacks ----------
-@dp.message_handler(commands=['start', 'help'])
-async  def cmd_start(message: types.Message):
-    try:
-        add_user(message.chat.id)
-        send_text = ("👋 Привет! Я крипто-бот.\n\n"
-                     "Управление через кнопки. Нажми кнопку ниже.")
-        await  bot.send_message(message.chat.id, send_text, reply_markup=main_menu_kb())
-    except Exception:
-        logger.exception("cmd_start error")
-
-@dp.callback_query_handler(lambda c: c.data == 'back_main')
-async def cb_back_main(callback_query: types.CallbackQuery):
-    try:
-        bot.edit_message_text("Главное меню:", callback_query.from_user.id, callback_query.message.message_id, reply_markup=main_menu_kb())
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_back_main error")
+            logger.exception("price_polling_worker loop error")
+        # wait
         try:
-            bot.answer_callback_query(callback_query.id, text="Ошибка")
+            await asyncio.wait_for(stop_event.wait(), timeout=PRICE_POLL_INTERVAL)
+        except asyncio.TimeoutError:
+            continue
+    logger.info("Price polling worker stopped")
+
+# -------------- UI helpers (keyboards) --------------
+def main_menu_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("💰 Цена (все)", callback_data="price_all"),
+        InlineKeyboardButton("📊 График", callback_data="chart_menu")
+    )
+    kb.add(
+        InlineKeyboardButton("🔔 Добавить Alert", callback_data="add_alert"),
+        InlineKeyboardButton("📋 Мои Alerts", callback_data="my_alerts")
+    )
+    kb.add(
+        InlineKeyboardButton("📈 Авто-сигналы", callback_data="signals_menu"),
+        InlineKeyboardButton("⚙️ Мои монеты", callback_data="my_symbols")
+    )
+    kb.add(InlineKeyboardButton("📜 История", callback_data="history_menu"))
+    return kb
+
+def symbol_list_kb(symbols: List[str], prefix: str):
+    kb = InlineKeyboardMarkup(row_width=3)
+    for s in symbols:
+        label = s.split("/")[0]
+        kb.insert(InlineKeyboardButton(label, callback_data=f"{prefix}|{label}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+    return kb
+
+def price_steps_kb(include_autotime: bool = True):
+    kb = InlineKeyboardMarkup(row_width=6)
+    # negative steps (display plain)
+    for s in PRICE_STEPS[:6]:
+        kb.insert(InlineKeyboardButton(str(int(s)), callback_data=f"step|{int(s)}"))
+    # positive
+    for s in PRICE_STEPS[6:]:
+        kb.insert(InlineKeyboardButton(f"+{int(s)}", callback_data=f"step|{int(s)}"))
+    last_row = []
+    if include_autotime:
+        last_row.append(InlineKeyboardButton("⏱ Автоподтв.", callback_data="auto_time"))
+    last_row.append(InlineKeyboardButton("✅ Готово", callback_data="price_confirm"))
+    for b in last_row:
+        kb.add(b)
+    return kb
+
+def autotime_kb():
+    kb = InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        InlineKeyboardButton("5 сек", callback_data="autotime|5"),
+        InlineKeyboardButton("10 сек", callback_data="autotime|10"),
+        InlineKeyboardButton("30 сек", callback_data="autotime|30")
+    )
+    kb.add(InlineKeyboardButton("Отключить", callback_data="autotime|0"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_price"))
+    return kb
+
+def alerts_list_kb(alerts: List[tuple]):
+    kb = InlineKeyboardMarkup(row_width=1)
+    for a in alerts:
+        aid, sym, targ, atype, rec, a_until = a
+        label = ( "🔂" if rec else "☑️") + f" {sym.split('/')[0]} {atype} {targ}"
+        kb.add(InlineKeyboardButton(label, callback_data=f"del_alert|{aid}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+    return kb
+
+# -------------- Command & Callback handlers --------------
+@dp.message_handler(commands=["start", "help"])
+async def cmd_start(message: types.Message):
+    try:
+        await add_user(message.chat.id)
+        send_text = ("👋 Привет! Я крипто-бот.\n\n"
+                     "Управление через кнопки ниже. Нажми меню.")
+        await bot.send_message(message.chat.id, send_text, reply_markup=main_menu_kb())
+    except Exception:
+        logger.exception("cmd_start failed")
+
+@dp.callback_query_handler(lambda c: True)
+async def all_callbacks(cb: types.CallbackQuery):
+    data = cb.data or ""
+    chat_id = cb.from_user.id
+    try:
+        await add_user(chat_id)
+        await log_db("info", f"callback: {data} from {chat_id}")
+        # navigation
+        if data == "back_main":
+            await bot.send_message(chat_id, "Главное меню:", reply_markup=main_menu_kb())
+            await cb.answer()
+            return
+        if data == "price_all":
+            # send all prices immediately
+            # gather user's symbols
+            syms = await get_user_symbols(chat_id)
+            lines = []
+            for s in syms:
+                price = last_prices.get(s)
+                if price is None:
+                    lines.append(f"{s}: n/a")
+                else:
+                    lines.append(f"{s}: {price}$")
+            await bot.send_message(chat_id, "📡 Текущие цены:\n" + "\n".join(lines))
+            await cb.answer()
+            return
+        if data == "chart_menu":
+            # ask user to choose symbol and timeframe
+            syms = await get_user_symbols(chat_id)
+            kb = symbol_list_kb(syms, "chart_select")
+            await bot.send_message(chat_id, "Выберите монету для графика:", reply_markup=kb)
+            await cb.answer()
+            return
+        if data.startswith("chart_select|"):
+            label = data.split("|", 1)[1]
+            symbol = label + "/USDT"
+            # ask timeframe
+            kb = InlineKeyboardMarkup(row_width=3)
+            tf_list = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+            for tf in tf_list:
+                kb.insert(InlineKeyboardButton(tf, callback_data=f"chart_build|{symbol}|{tf}"))
+            kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="chart_menu"))
+            await bot.send_message(chat_id, f"Выбрана {symbol}. Выберите таймфрейм:", reply_markup=kb)
+            await cb.answer()
+            return
+        if data.startswith("chart_build|"):
+            _, symbol, tf = data.split("|", 2)
+            await cb.answer("Генерирую график... Подождите")
+            # build candlestick chart (could be heavy)
+            chart_bytes = await build_candlestick_chart(symbol, timeframe=tf, points=200)
+            if chart_bytes:
+                await bot.send_photo(chat_id, ('chart.png', chart_bytes), caption=f"{symbol} {tf} свечи")
+            else:
+                await bot.send_message(chat_id, "Не удалось сгенерировать график.")
+            return
+        if data == "add_alert":
+            syms = await get_user_symbols(chat_id)
+            kb = symbol_list_kb(syms, "add_alert_select")
+            await bot.send_message(chat_id, "Выберите монету для Alert:", reply_markup=kb)
+            await cb.answer()
+            return
+        if data.startswith("add_alert_select|"):
+            label = data.split("|",1)[1]
+            symbol = label + "/USDT"
+            # initialize pending alert state
+            pending_alerts[str(chat_id)] = {
+                "coin": label,
+                "symbol": symbol,
+                "price": 0.0,
+                "msg_id": None,
+                "last_step": None,
+                "last_time": time.time(),
+                "multiplier": 1,
+                "autotime": 10,
+                "awaiting_type": False
+            }
+            # fetch base price
+            base_price = await fetch_ticker_async(symbol) or 0.0
+            pending_alerts[str(chat_id)]["price"] = base_price
+            kb = price_steps_kb(include_autotime=True)
+            resp = await bot.send_message(chat_id, f"{label}\nБазовая цена: {base_price}$\nНастройте цену кнопками:", reply_markup=kb)
+            pending_alerts[str(chat_id)]["msg_id"] = resp.message_id
+            # start auto-confirm task (just mark time - actual timer uses asyncio.create_task)
+            pending_alerts[str(chat_id)]["last_time"] = time.time()
+            # start autoconfirm watcher
+            asyncio.create_task(_autoconfirm_watcher(chat_id))
+            await cb.answer()
+            return
+        if data.startswith("step|"):
+            step_val = int(data.split("|",1)[1])
+            key = str(chat_id)
+            if key in pending_alerts:
+                alert = pending_alerts[key]
+                now = time.time()
+                if alert.get("last_step") == step_val and now - alert.get("last_time",0) < 3:
+                    alert["multiplier"] = alert.get("multiplier",1) + 1
+                else:
+                    alert["multiplier"] = 1
+                final_step = step_val * alert["multiplier"]
+                alert["price"] = max(0, alert.get("price",0) + final_step)
+                alert["last_step"] = step_val
+                alert["last_time"] = now
+                # update message
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=alert["msg_id"],
+                                                text=f"📊 {alert['coin']}\nТекущая цена: {alert['price']}$\n(шаг {step_val}$ ×{alert['multiplier']} = {final_step}$)",
+                                                reply_markup=price_steps_kb(include_autotime=True))
+                except Exception:
+                    logger.debug("Failed edit message for price step")
+            await cb.answer()
+            return
+        if data == "auto_time":
+            key = str(chat_id)
+            if key in pending_alerts:
+                alert = pending_alerts[key]
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=alert["msg_id"],
+                                                text=f"⏱️ Сейчас: {'выкл' if alert.get('autotime',0)==0 else str(alert.get('autotime'))+' сек'}\nВыберите новое:",
+                                                reply_markup=autotime_kb())
+                except Exception:
+                    logger.debug("auto_time edit failed")
+            await cb.answer()
+            return
+        if data.startswith("autotime|"):
+            val = int(data.split("|",1)[1])
+            key = str(chat_id)
+            if key in pending_alerts:
+                pending_alerts[key]["autotime"] = val
+                alert = pending_alerts[key]
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=alert["msg_id"],
+                                                text=f"📊 {alert['coin']}\nТекущая цена: {alert['price']}$\n⏱ Автоподтв.: {'выкл' if val==0 else str(val)+' сек'}",
+                                                reply_markup=price_steps_kb(include_autotime=True))
+                except Exception:
+                    logger.debug("autotime edit failed")
+            await cb.answer()
+            return
+        if data == "price_confirm":
+            key = str(chat_id)
+            if key in pending_alerts:
+                alert = pending_alerts[key]
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=alert["msg_id"],
+                                                text=f"✅ Вы выбрали {alert['coin']} при цене {alert['price']}$.\nТеперь выберите тип сигнала:")
+                except Exception:
+                    logger.debug("price_confirm edit failed")
+                kb = InlineKeyboardMarkup(row_width=3)
+                kb.add(InlineKeyboardButton("📈 Выше", callback_data="type|above"),
+                       InlineKeyboardButton("📉 Ниже", callback_data="type|below"),
+                       InlineKeyboardButton("🔄 Пересечение", callback_data="type|cross"))
+                await bot.send_message(chat_id, "Выберите тип сигнала:", reply_markup=kb)
+                alert["awaiting_type"] = True
+            await cb.answer()
+            return
+        if data.startswith("type|"):
+            typ = data.split("|",1)[1]
+            key = str(chat_id)
+            if key in pending_alerts and pending_alerts[key].get("awaiting_type"):
+                pending_alerts[key]["type_selected"] = typ
+                kb = InlineKeyboardMarkup(row_width=2)
+                kb.add(InlineKeyboardButton("☑️ Одноразовый", callback_data="rec|no"),
+                       InlineKeyboardButton("🔂 Постоянный", callback_data="rec|yes"))
+                await bot.send_message(chat_id, "Одноразовый или постоянный?", reply_markup=kb)
+            await cb.answer()
+            return
+        if data.startswith("rec|"):
+            rec = 1 if data.split("|",1)[1] == "yes" else 0
+            key = str(chat_id)
+            if key in pending_alerts:
+                pending_alerts[key]["recurring"] = rec
+                kb = InlineKeyboardMarkup(row_width=2)
+                kb.add(InlineKeyboardButton("⏰ Только сегодня", callback_data="time|today"),
+                       InlineKeyboardButton("📅 Задать часы", callback_data="time|custom"))
+                kb.add(InlineKeyboardButton("♾️ Без огранич.", callback_data="time|none"))
+                await bot.send_message(chat_id, "Ограничить сигнал по времени?", reply_markup=kb)
+            await cb.answer()
+            return
+        if data == "time|today":
+            key = str(chat_id)
+            if key in pending_alerts:
+                pending_alerts[key]["active_until"] = (datetime.utcnow().replace(hour=23, minute=59, second=59)).strftime("%Y-%m-%d %H:%M:%S")
+                a = pending_alerts[key]
+                await save_alert_to_db(chat_id, f"{a['coin']}/USDT", a['price'], a.get("type_selected","cross"), a.get("recurring",0), a.get("active_until"))
+                await bot.send_message(chat_id, f"✅ Alert добавлен: {a['coin']}/USDT {a.get('type_selected','cross')} {a['price']}$ (до конца дня)")
+                del pending_alerts[key]
+            await cb.answer()
+            return
+        if data == "time|none":
+            key = str(chat_id)
+            if key in pending_alerts:
+                a = pending_alerts[key]
+                await save_alert_to_db(chat_id, f"{a['coin']}/USDT", a['price'], a.get("type_selected","cross"), a.get("recurring",0), None)
+                await bot.send_message(chat_id, f"✅ Alert добавлен: {a['coin']}/USDT {a.get('type_selected','cross')} {a['price']}$ (без ограничений)")
+                del pending_alerts[key]
+            await cb.answer()
+            return
+        if data == "time|custom":
+            key = str(chat_id)
+            if key in pending_alerts:
+                pending_alerts[key]["awaiting_time"] = True
+                await bot.send_message(chat_id, "Введите срок действия в часах (например: 24):")
+            await cb.answer()
+            return
+        if data == "my_alerts":
+            rows = await list_user_alerts(chat_id)
+            if not rows:
+                await bot.send_message(chat_id, "У вас пока нет активных Alerts.", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main")))
+            else:
+                kb = alerts_list_kb(rows)
+                await bot.send_message(chat_id, "Ваши Alerts (нажмите чтобы удалить):", reply_markup=kb)
+            await cb.answer()
+            return
+        if data.startswith("del_alert|"):
+            aid = int(data.split("|",1)[1])
+            await delete_alert(aid, chat_id)
+            await bot.send_message(chat_id, "✅ Alert удалён.")
+            await cb.answer()
+            return
+        if data == "my_symbols":
+            syms = await get_user_symbols(chat_id)
+            lines = ["Ваши монеты:"]
+            lines.extend(syms)
+            kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➕ Добавить монету", callback_data="add_symbol")).add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
+            await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb)
+            await cb.answer()
+            return
+        if data == "add_symbol":
+            pending_alerts[str(chat_id)] = {"awaiting_new_symbol": True}
+            await bot.send_message(chat_id, "Введите символ монеты (например: ADA или ADA/USDT).")
+            await cb.answer()
+            return
+        # fallback
+        await cb.answer("Неизвестная кнопка")
+    except Exception:
+        logger.exception("callback handler error for %s", data)
+        try:
+            await cb.answer("Ошибка обработки. Посмотрите логи.")
         except Exception:
             pass
 
-# Price all
-@dp.callback_query_handler(lambda c: c.data == 'price_all')
-async def cb_price_all(callback_query: types.CallbackQuery):
-    try:
-        add_user(callback_query.from_user.id)
-        text_lines = []
-        # gather symbols (user-specific plus async defaults)
-        syms = set( defAULT_SYMBOLS)
-        try:
-            cur.execute("SELECT DISTINCT symbol FROM user_symbols WHERE chat_id=?", (str(callback_query.from_user.id),))
-            rows = cur.fetchall()
-            syms.update(r[0] for r in rows)
-        except Exception:
-            logger.exception("cb_price_all symbols fetch error")
-        for s in sorted(syms):
-            price = last_prices.get(s)
-            display = f"{price}$" if price is not None else "n/a"
-            text_lines.append(f"{s}: {display}")
-        msg = "\n".join(text_lines) if text_lines else "Нет данных"
-        await bot.send_message(callback_query.from_user.id, f"💱 Текущие цены:\n{msg}", reply_markup=main_menu_kb())
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_price_all error")
-
-# Price single by symbol from inline buttons
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("price_"))
-async def cb_price_single(callback_query: types.CallbackQuery):
-    try:
-        symbol_label = callback_query.data.split("_",1)[1]
-        # find full symbol (search in user list and async defaults)
-        full = None
-        candidates = defAULT_SYMBOLS.copy()
-        try:
-            cur.execute("SELECT symbol FROM user_symbols WHERE chat_id=?", (str(callback_query.from_user.id),))
-            rows = cur.fetchall()
-            if rows:
-                candidates += [r[0] for r in rows]
-        except Exception:
-            logger.exception("cb_price_single fetch user_symbols")
-        for c in candidates:
-            if c.split("/")[0] == symbol_label:
-                full = c
-                break
-        if full is None:
-            bot.answer_callback_query(callback_query.id, text="Монета не найдена")
-            return
-        price = last_prices.get(full)
-        await bot.send_message(callback_query.from_user.id, f"💰 {full}: {price if price is not None else 'n/a'}$", reply_markup=main_menu_kb())
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_price_single error")
-
-# Chart menu: choose symbol then timeframe
-@dp.callback_query_handler(lambda c: c.data == 'chart_menu')
-async def cb_chart_menu(callback_query: types.CallbackQuery):
-    try:
-        syms = get_user_symbols(callback_query.from_user.id)
-        kb = symbols_keyboard(syms, prefix="chart", per_row=3)
-        await bot.send_message(callback_query.from_user.id, "Выберите монету для графика:", reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_chart_menu error")
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("chart_"))
-async def cb_chart_choose_symbol(callback_query: types.CallbackQuery):
-    try:
-        label = callback_query.data.split("_",1)[1]
-        # save pending state
-        pending_alerts[str(callback_query.from_user.id)] = {"chart_symbol": label}
-        # ask timeframe
-        kb = InlineKeyboardMarkup(row_width=3)
-        for tf in ["1m","5m","15m","30m","1h","4h","1d"]:
-            kb.insert(InlineKeyboardButton(tf, callback_data=f"chart_tf_{tf}"))
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        await bot.send_message(callback_query.from_user.id, f"Выбрана {label}. Выберите таймфрейм:", reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_chart_choose_symbol error")
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("chart_tf_"))
-async def cb_chart_generate(callback_query: types.CallbackQuery):
-    try:
-        tf = callback_query.data.split("_",2)[2]
-        key = str(callback_query.from_user.id)
-        state = pending_alerts.get(key, {})
-        symbol_label = state.get("chart_symbol")
-        if not symbol_label:
-            bot.answer_callback_query(callback_query.id, text="Сначала выберите монету")
-            return
-        # find full symbol
-        full = None
-        syms = get_user_symbols(callback_query.from_user.id)
-        for s in syms:
-            if s.split("/")[0] == symbol_label:
-                full = s
-                break
-        if not full:
-            bot.answer_callback_query(callback_query.id, text="Пара не найдена")
-            return
-        bot.answer_callback_query(callback_query.id, text="Генерирую график... (может занять время)")
-        imgbuf = build_candlestick_chart(full, timeframe=tf, points=200)
-        if not imgbuf:
-            await bot.send_message(callback_query.from_user.id, "Не удалось построить график (недостаточно данных или отсутствуют библиотеки).", reply_markup=main_menu_kb())
-            return
-        # send as photo
-        try:
-            imgbuf.seek(0)
-            bot.send_photo(callback_query.from_user.id, ('chart.png', imgbuf), caption=f"{full} {tf}")
-        except Exception:
-            # alternative: send as document
-            try:
-                imgbuf.seek(0)
-                bot.send_document(callback_query.from_user.id, ('chart.png', imgbuf), caption=f"{full} {tf}")
-            except Exception:
-                logger.exception("Failed to send chart")
-                await bot.send_message(callback_query.from_user.id, "Ошибка при отправке графика.")
-    except Exception:
-        logger.exception("cb_chart_generate error")
-
-# Add alert flow: choose coin via buttons
-@dp.callback_query_handler(lambda c: c.data == 'add_alert')
-async def cb_add_alert_start(callback_query: types.CallbackQuery):
-    try:
-        syms = get_user_symbols(callback_query.from_user.id)
-        kb = symbols_keyboard(syms, prefix="set_alert", per_row=3)
-        await bot.send_message(callback_query.from_user.id, "Выберите монету для создания alert:", reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_add_alert_start error")
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("set_alert_"))
-async def cb_add_alert_choose(callback_query: types.CallbackQuery):
-    try:
-        coin = callback_query.data.split("_",2)[2]
-        symbol = coin + "/USDT"
-        base_price = fetch_price_for_symbol(symbol) or 0.0
-        # pending flow
-        pending_alerts[str(callback_query.from_user.id)] = {
-            "coin": coin,
-            "symbol": symbol,
-            "price": base_price,
-            "msg_id": None,
-            "last_step": None,
-            "last_time": time.time(),
-            "multiplier": 1,
-            "autotime": 10,
-            "awaiting_type": False
-        }
-        kb = price_steps_kb(include_confirm=True)
-        resp = await bot.send_message(callback_query.from_user.id, f"{coin}\nБазовая цена: {base_price}$\nНастройте цену кнопками:", reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_add_alert_choose error")
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("step_"))
-async def cb_price_step(callback_query: types.CallbackQuery):
-    try:
-        raw = callback_query.data.split("_",1)[1]
-        try:
-            step = int(raw)
-        except:
-            step = 0
-        key = str(callback_query.from_user.id)
-        if key not in pending_alerts:
-            bot.answer_callback_query(callback_query.id, text="Нет активного создания alert")
-            return
-        alert = pending_alerts[key]
-        now = time.time()
-        if alert.get("last_step") == step and now - alert.get("last_time",0) < 3:
-            alert["multiplier"] = alert.get("multiplier",1) + 1
-        else:
-            alert["multiplier"] = 1
-        final_step = step * alert["multiplier"]
-        alert["price"] = max(0, alert.get("price",0) + final_step)
-        alert["last_step"] = step
-        alert["last_time"] = now
-        # update message
-        text = f"📊 {alert['coin']}\nТекущая цена: {alert['price']}$\n(шаг {step}$ ×{alert['multiplier']} = {final_step}$)"
-        try:
-            # try editing last bot message (best-effort)
-            if callback_query.message:
-                bot.edit_message_text(text, callback_query.from_user.id, callback_query.message.message_id, reply_markup=price_steps_kb(include_confirm=True))
-        except Exception:
-            # fallback: send new message
-            await bot.send_message(callback_query.from_user.id, text, reply_markup=price_steps_kb(include_confirm=True))
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_price_step error")
-
-@dp.callback_query_handler(lambda c: c.data == 'auto_time')
-async def cb_auto_time(callback_query: types.CallbackQuery):
-    try:
-        key = str(callback_query.from_user.id)
-        if key not in pending_alerts:
-            bot.answer_callback_query(callback_query.id, text="Нет активного создания alert")
-            return
-        bot.edit_message_text("Выберите время автоподтв.:", callback_query.from_user.id, callback_query.message.message_id, reply_markup=autotime_kb())
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_auto_time error")
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("auto_"))
-async def cb_auto_set(callback_query: types.CallbackQuery):
-    try:
-        val = int(callback_query.data.split("_",1)[1])
-        key = str(callback_query.from_user.id)
-        if key in pending_alerts:
-            pending_alerts[key]["autotime"] = val
-            alert = pending_alerts[key]
-            text = f"📊 {alert['coin']}\nТекущая цена: {alert['price']}$\n⏱ Автоподтв.: {'выкл' if val==0 else str(val)+' сек'}"
-            bot.edit_message_text(text, callback_query.from_user.id, callback_query.message.message_id, reply_markup=price_steps_kb(include_confirm=True))
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_auto_set error")
-
-@dp.callback_query_handler(lambda c: c.data == 'price_confirm')
-async def cb_price_confirm(callback_query: types.CallbackQuery):
-    try:
-        key = str(callback_query.from_user.id)
-        if key not in pending_alerts:
-            bot.answer_callback_query(callback_query.id, text="Нет активного создания alert")
-            return
-        a = pending_alerts[key]
-        # ask type
-        kb = InlineKeyboardMarkup(row_width=3)
-        kb.row(InlineKeyboardButton("📈 Выше", callback_data="alert_type_above"),
-               InlineKeyboardButton("📉 Ниже", callback_data="alert_type_below"),
-               InlineKeyboardButton("🔄 Пересечение", callback_data="alert_type_cross"))
-        await bot.send_message(callback_query.from_user.id, f"✅ Вы выбрали {a['coin']} при цене {a['price']}$.\nВыберите тип сигнала:", reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_price_confirm error")
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("alert_type_"))
-async def cb_alert_type(callback_query: types.CallbackQuery):
-    try:
-        typ = callback_query.data.split("_",2)[2]
-        key = str(callback_query.from_user.id)
-        if key in pending_alerts:
-            pending_alerts[key]["type_selected"] = typ
-            # ask recurring
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.row(InlineKeyboardButton("☑️ Одноразовый", callback_data="alert_rec_no"),
-                   InlineKeyboardButton("🔂 Постоянный", callback_data="alert_rec_yes"))
-            await bot.send_message(callback_query.from_user.id, "Одноразовый или постоянный?", reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_alert_type error")
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("alert_rec_"))
-async def cb_alert_recurring(callback_query: types.CallbackQuery):
-    try:
-        rec = 1 if callback_query.data.endswith("yes") else 0
-        key = str(callback_query.from_user.id)
-        if key in pending_alerts:
-            pending_alerts[key]["recurring"] = rec
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.row(InlineKeyboardButton("⏰ Только сегодня", callback_data="time_today"),
-                   InlineKeyboardButton("📅 Задать часы", callback_data="time_custom"))
-            kb.row(InlineKeyboardButton("♾️ Без ограничений", callback_data="time_none"),
-                   InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-            await bot.send_message(callback_query.from_user.id, "Ограничить сигнал по времени?", reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_alert_recurring error")
-
-@dp.callback_query_handler(lambda c: c.data == 'time_today')
-async def cb_time_today(callback_query: types.CallbackQuery):
-    try:
-        key = str(callback_query.from_user.id)
-        if key in pending_alerts:
-            active_until = (datetime.utcnow().replace(hour=23, minute=59, second=59)).strftime("%Y-%m-%d %H:%M:%S")
-            pending_alerts[key]["active_until"] = active_until
-            a = pending_alerts[key]
-            ok = save_alert_to_db(callback_query.from_user.id, f"{a['symbol']}", a['price'], a.get("type_selected","cross"), a.get("recurring",0), a.get("active_until"), None, None)
-            if ok:
-                await bot.send_message(callback_query.from_user.id, f"✅ Alert добавлен: {a['symbol']} {a.get('type_selected','cross')} {a['price']}$ (до конца дня)")
-                log_db("info", f"Alert saved for {callback_query.from_user.id} {a['symbol']} {a['price']}")
-            else:
-                await bot.send_message(callback_query.from_user.id, "Ошибка при сохранении алерта.")
-            del pending_alerts[key]
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_time_today error")
-
-@dp.callback_query_handler(lambda c: c.data == 'time_none')
-async def cb_time_none(callback_query: types.CallbackQuery):
-    try:
-        key = str(callback_query.from_user.id)
-        if key in pending_alerts:
-            a = pending_alerts[key]
-            ok = save_alert_to_db(callback_query.from_user.id, f"{a['symbol']}", a['price'], a.get("type_selected","cross"), a.get("recurring",0), None, None, None)
-            if ok:
-                await bot.send_message(callback_query.from_user.id, f"✅ Alert добавлен: {a['symbol']} {a.get('type_selected','cross')} {a['price']}$")
-                log_db("info", f"Alert saved for {callback_query.from_user.id} {a['symbol']} {a['price']}")
-            else:
-                await bot.send_message(callback_query.from_user.id, "Ошибка при сохранении алерта.")
-            del pending_alerts[key]
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_time_none error")
-
-@dp.callback_query_handler(lambda c: c.data == 'time_custom')
-async def cb_time_custom(callback_query: types.CallbackQuery):
-    try:
-        key = str(callback_query.from_user.id)
-        if key in pending_alerts:
-            pending_alerts[key]["awaiting_time"] = True
-            await bot.send_message(callback_query.from_user.id, "Введите срок действия в часах (например: 24):")
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_time_custom error")
-
-# message handler for awaiting_time and awaiting_new_symbol (text messages)
 @dp.message_handler()
-async def msg_text_handler(message: types.Message):
+async def all_text_handler(message: types.Message):
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
     try:
-        add_user(message.chat.id)
-        key = str(message.chat.id)
-        state = pending_alerts.get(key)
-        if state and state.get("awaiting_time"):
-            try:
-                hours = int(message.text.strip())
-                active_until = (datetime.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-                a = pending_alerts[key]
-                a["active_until"] = active_until
-                ok = save_alert_to_db(message.chat.id, f"{a['symbol']}", a['price'], a.get("type_selected","cross"), a.get("recurring",0), a.get("active_until"), None, None)
-                if ok:
-                    await bot.send_message(message.chat.id, f"✅ Alert добавлен: {a['symbol']} {a.get('type_selected','cross')} {a['price']}$ (до {active_until})")
-                    log_db("info", f"Alert saved for {message.chat.id} {a['symbol']} {a['price']}")
-                else:
-                    await bot.send_message(message.chat.id, "Ошибка при сохранении алерта.")
-                del pending_alerts[key]
-            except Exception:
-                await bot.send_message(message.chat.id, "Ошибка: введите целое число часов (например: 24).")
-            finally:
-                await bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
-            return
-
-        # new symbol adding flow (if any)
-        if state and state.get("awaiting_new_symbol"):
-            symbol = message.text.upper().strip()
+        await add_user(chat_id)
+        await log_db("info", f"msg from {chat_id}: {text}")
+        key = str(chat_id)
+        # awaiting new symbol
+        if key in pending_alerts and pending_alerts[key].get("awaiting_new_symbol"):
+            symbol = text.upper().strip()
             if "/" not in symbol:
                 symbol = f"{symbol}/USDT"
             try:
-                # check markets
-                markets = exchange.load_markets()
+                markets = await asyncio.get_event_loop().run_in_executor(EXECUTOR, exchange.load_markets)
                 if symbol in markets:
-                    add_user_symbol(message.chat.id, symbol)
-                    await bot.send_message(message.chat.id, f"✅ Монета {symbol} добавлена в ваш список.")
+                    await add_user_symbol(chat_id, symbol)
+                    await bot.send_message(chat_id, f"✅ Монета {symbol} добавлена в ваш список.")
                 else:
-                    await bot.send_message(message.chat.id, f"❌ Пара {symbol} не найдена на MEXC.")
+                    await bot.send_message(chat_id, f"❌ Пара {symbol} не найдена на MEXC.")
             except Exception:
-                logger.exception("Error checking markets")
-                await bot.send_message(message.chat.id, f"Ошибка при проверке {symbol}.")
+                logger.exception("Error checking symbol")
+                await bot.send_message(chat_id, f"Ошибка при проверке {symbol}.")
             del pending_alerts[key]
-            await bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
+            await bot.send_message(chat_id, "Меню:", reply_markup=main_menu_kb())
             return
-
-        # fallback - other text commands: /price SYMBOL, /chart SYMBOL
-        text = (message.text or "").strip()
+        # awaiting custom time hours for alert
+        if key in pending_alerts and pending_alerts[key].get("awaiting_time"):
+            try:
+                hours = int(text.strip())
+                active_until = (datetime.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+                a = pending_alerts[key]
+                a["active_until"] = active_until
+                await save_alert_to_db(chat_id, f"{a['coin']}/USDT", a['price'], a.get("type_selected","cross"), a.get("recurring",0), a.get("active_until"))
+                await bot.send_message(chat_id, f"✅ Alert добавлен: {a['coin']}/USDT {a.get('type_selected','cross')} {a['price']}$ (до {active_until})")
+                del pending_alerts[key]
+            except Exception:
+                logger.exception("awaiting_time error")
+                await bot.send_message(chat_id, "Ошибка: введите целое число часов (например: 24).")
+            await bot.send_message(chat_id, "Меню:", reply_markup=main_menu_kb())
+            return
+        # commands fallback
         if text.startswith("/price"):
             parts = text.split()
             if len(parts) == 2:
@@ -889,165 +919,158 @@ async def msg_text_handler(message: types.Message):
                 if "/" not in s:
                     s = s + "/USDT"
                 price = last_prices.get(s)
-                await bot.send_message(message.chat.id, f"💰 {s}: {price if price is not None else 'n/a'}$")
+                if price is not None:
+                    await bot.send_message(chat_id, f"💰 {s}: {price}$", reply_markup=main_menu_kb())
+                else:
+                    await bot.send_message(chat_id, f"Нет данных для {s}.", reply_markup=main_menu_kb())
             else:
-                await bot.send_message(message.chat.id, "Использование: /price SYMBOL")
-            await bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
+                await bot.send_message(chat_id, "Использование: /price SYMBOL", reply_markup=main_menu_kb())
             return
-
         if text.startswith("/chart"):
             parts = text.split()
             if len(parts) >= 2:
                 s = parts[1].upper()
                 if "/" not in s:
                     s = s + "/USDT"
-                buf = build_candlestick_chart(s, timeframe="1h", points=200)
+                buf = await build_line_chart_image(s, points=80, sma_list=[5,20], ema_list=[10], show_rsi=False, show_macd=False)
                 if buf:
-                    try:
-                        buf.seek(0)
-                        bot.send_photo(message.chat.id, ('chart.png', buf), caption=f"{s} — график")
-                    except Exception:
-                        await bot.send_message(message.chat.id, "Ошибка отправки графика")
+                    await bot.send_photo(chat_id, ('chart.png', buf), caption=f"{s} — график", reply_markup=main_menu_kb())
                 else:
-                    await bot.send_message(message.chat.id, "Недостаточно данных или отсутствует библиотека графиков.")
+                    await bot.send_message(chat_id, "Недостаточно данных для графика.", reply_markup=main_menu_kb())
             else:
-                await bot.send_message(message.chat.id, "Использование: /chart SYMBOL")
-            await bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu_kb())
+                await bot.send_message(chat_id, "Использование: /chart SYMBOL", reply_markup=main_menu_kb())
             return
-
-        # async default menu
-        await bot.send_message(message.chat.id, "Выберите действие:", reply_markup=main_menu_kb())
-    except Exception:
-        logger.exception("msg_text_handler error")
-
-# My alerts list
-@dp.callback_query_handler(lambda c: c.data == 'my_alerts')
-async def cb_my_alerts(callback_query: types.CallbackQuery):
-    try:
-        rows = list_user_alerts(callback_query.from_user.id)
-        if not rows:
-            await bot.send_message(callback_query.from_user.id, "У вас пока нет активных Alerts.", reply_markup=main_menu_kb())
-            bot.answer_callback_query(callback_query.id)
+        if text.startswith("/alerts"):
+            rows = await list_user_alerts(chat_id)
+            if not rows:
+                await bot.send_message(chat_id, "У вас нет Alerts.", reply_markup=main_menu_kb())
+            else:
+                lines = []
+                for r in rows:
+                    aid, sym, targ, atype, rec, a_until = r
+                    lines.append(f"{aid}: {sym} {atype} {targ}$ {'🔂' if rec else '☑️'}")
+                await bot.send_message(chat_id, "\n".join(lines), reply_markup=main_menu_kb())
             return
-        kb = InlineKeyboardMarkup(row_width=1)
-        for r in rows:
-            aid, sym, targ, atype, rec, a_until = r
-            label = ("🔂" if rec else "☑️") + f" {sym} {atype} {targ}$"
-            kb.add(InlineKeyboardButton(label, callback_data=f"del_alert_{aid}"))
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        await bot.send_message(callback_query.from_user.id, "Ваши Alerts (нажмите чтобы удалить):", reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
+        # default show menu
+        await bot.send_message(chat_id, "Выберите действие:", reply_markup=main_menu_kb())
     except Exception:
-        logger.exception("cb_my_alerts error")
+        logger.exception("all_text_handler error")
+        try:
+            await bot.send_message(chat_id, "Произошла ошибка. Посмотрите логи.")
+        except Exception:
+            pass
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("del_alert_"))
-async def cb_delete_alert(callback_query: types.CallbackQuery):
+# -------------- Autoconfirm watcher for pending alerts --------------
+async def _autoconfirm_watcher(chat_id: int):
+    """
+    Watches pending_alerts[chat_id] and performs auto-confirm if user doesn't interact.
+    """
     try:
-        aid = int(callback_query.data.split("_",2)[2])
-        delete_alert(aid, callback_query.from_user.id)
-        await bot.send_message(callback_query.from_user.id, "✅ Alert удалён.", reply_markup=main_menu_kb())
-        bot.answer_callback_query(callback_query.id)
+        key = str(chat_id)
+        # wait until autotime elapsed from last_time
+        while key in pending_alerts:
+            alert = pending_alerts[key]
+            autotime = alert.get("autotime", 10)
+            if autotime == 0:
+                return
+            last = alert.get("last_time", time.time())
+            wait = max(0, autotime - (time.time() - last))
+            await asyncio.sleep(wait)
+            if key not in pending_alerts:
+                return
+            alert2 = pending_alerts[key]
+            if time.time() - alert2.get("last_time", 0) >= autotime:
+                # auto-confirm: ask for type
+                try:
+                    mid = alert2.get("msg_id")
+                    if mid:
+                        try:
+                            await bot.edit_message_text(chat_id=chat_id, message_id=mid, text=f"✅ Автоподтверждение: {alert2.get('coin')} при цене {alert2.get('price')}$.\nВыберите тип сигнала:")
+                        except Exception:
+                            pass
+                    kb = InlineKeyboardMarkup(row_width=3)
+                    kb.add(InlineKeyboardButton("📈 Выше", callback_data="type|above"),
+                           InlineKeyboardButton("📉 Ниже", callback_data="type|below"),
+                           InlineKeyboardButton("🔄 Пересечение", callback_data="type|cross"))
+                    await bot.send_message(chat_id, "Какой тип сигнала поставить?", reply_markup=kb)
+                    alert2["awaiting_type"] = True
+                except Exception:
+                    logger.exception("auto confirm failed")
+                return
     except Exception:
-        logger.exception("cb_delete_alert error")
+        logger.exception("_autoconfirm_watcher error")
 
-# My symbols
-@dp.callback_query_handler(lambda c: c.data == 'my_symbols')
-async def cb_my_symbols(callback_query: types.CallbackQuery):
+# -------------- Startup & Shutdown --------------
+_stop_event = asyncio.Event()
+_price_task: Optional[asyncio.Task] = None
+
+async def on_startup(dp):
     try:
-        syms = get_user_symbols(callback_query.from_user.id)
-        text = "Ваши монеты:\n" + "\n".join(syms)
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("➕ Добавить монету", callback_data="add_symbol"))
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        await bot.send_message(callback_query.from_user.id, text, reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_my_symbols error")
-
-@dp.callback_query_handler(lambda c: c.data == 'add_symbol')
-async def cb_add_symbol(callback_query: types.CallbackQuery):
-    try:
-        pending_alerts[str(callback_query.from_user.id)] = {"awaiting_new_symbol": True}
-        await bot.send_message(callback_query.from_user.id, "Введите символ монеты (например: ADA или ADA/USDT).")
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_add_symbol error")
-
-# Settings (toggle signals)
-@dp.callback_query_handler(lambda c: c.data == 'settings')
-async def cb_settings(callback_query: types.CallbackQuery):
-    try:
-        cur.execute("SELECT signals_enabled FROM user_settings WHERE chat_id=?", (str(callback_query.from_user.id),))
-        row = cur.fetchone()
-        cur_val = row[0] if row else 0
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔁 Авто-сигналы Вкл/Выкл", callback_data="toggle_signals"))
-        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_main"))
-        await bot.send_message(callback_query.from_user.id, f"Авто-сигналы: {'Вкл' if cur_val==1 else 'Выкл'}", reply_markup=kb)
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_settings error")
-
-@dp.callback_query_handler(lambda c: c.data == 'toggle_signals')
-async def cb_toggle_signals(callback_query: types.CallbackQuery):
-    try:
-        cur.execute("SELECT signals_enabled FROM user_settings WHERE chat_id=?", (str(callback_query.from_user.id),))
-        row = cur.fetchone()
-        cur_val = row[0] if row else 0
-        new_val = 0 if cur_val == 1 else 1
-        cur.execute("INSERT OR REPLACE INTO user_settings (chat_id, signals_enabled) VALUES (?, ?)", (str(callback_query.from_user.id), new_val))
-        conn.commit()
-        await bot.send_message(callback_query.from_user.id, f"Авто-сигналы {'включены' if new_val==1 else 'выключены'}.")
-        bot.answer_callback_query(callback_query.id)
-    except Exception:
-        logger.exception("cb_toggle_signals error")
-
-# ---------- Startup / Shutdown ----------
-
-price_thread_stop = threading.Event()
-price_thread = threading.Thread(target=price_polling_worker, args=(price_thread_stop,), daemon=True)
-
-async def on_startup(dp: Dispatcher):
-    try:
-        logger.info("Starting background price thread")
-        price_thread.start()
+        await init_db()
+        # start price poller background task
+        global _price_task, _stop_event
+        _stop_event = asyncio.Event()
+        _price_task = asyncio.create_task(price_polling_worker(_stop_event))
+        logger.info("Started background price task")
+        # optionally set webhook if MODE=webhook
+        if MODE == "webhook":
+            if not WEBHOOK_URL:
+                logger.error("WEBHOOK_URL not set but running in webhook mode.")
+            else:
+                # aiogram's set_webhook is sync method (called via bot)
+                try:
+                    await bot.delete_webhook()
+                    await bot.set_webhook(WEBHOOK_URL + "/" + TELEGRAM_TOKEN)
+                    logger.info("Webhook set to %s", WEBHOOK_URL + "/" + TELEGRAM_TOKEN)
+                except Exception:
+                    logger.exception("Failed to set webhook")
     except Exception:
         logger.exception("on_startup error")
 
-async def on_shutdown(dp: Dispatcher):
+async def on_shutdown(dp):
     try:
-        logger.info("Shutting down: stopping price thread")
-        price_thread_stop.set()
-        price_thread.join(timeout=5)
+        logger.info("Shutting down: stopping price task")
+        global _price_task, _stop_event
+        if _stop_event and not _stop_event.is_set():
+            _stop_event.set()
+        if _price_task:
+            await asyncio.wait_for(_price_task, timeout=5)
+        # close db
+        try:
+            if _conn:
+                _conn.close()
+                logger.info("Closed DB connection")
+        except Exception:
+            logger.exception("Closing DB connection failed")
+        await bot.close()
     except Exception:
         logger.exception("on_shutdown error")
-    try:
-        logger.info("Closing DB connection")
-        conn.close()
-    except Exception:
-        logger.exception("Closing DB error")
 
-# ---------- Main entry ----------
-if __name__ == '__main__':
-    # Print small usage message
-    logger.info("Bot starting. Use TELEGRAM_TOKEN env var or token.txt. Polling mode by async default.")
-    # Start long polling
-    try:
+# -------------- Main entry --------------
+def main():
+    # choose to run polling or webhook
+    if MODE == "webhook":
+        # prepare webhook via executor.start_webhook
+        # Note: aiogram v2's executor.start_webhook expects certain args.
+        # To simplify: use polling as default; for webhook you must set WEBHOOK_URL env var.
+        logger.info("Running in webhook mode. Be sure WEBHOOK_URL is set: %s", WEBHOOK_URL)
+        from aiogram.utils.executor import start_webhook
+        WEBAPP_HOST = os.getenv("WEBAPP_HOST", "0.0.0.0")
+        WEBAPP_PORT = int(os.getenv("PORT", "8000"))
+        WEBHOOK_PATH = f"/{TELEGRAM_TOKEN}"
+        start_webhook(
+            dispatcher=dp,
+            webhook_path=WEBHOOK_PATH,
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            skip_updates=True,
+            host=WEBAPP_HOST,
+            port=WEBAPP_PORT,
+        )
+    else:
+        # polling
+        logger.info("Running in polling mode")
         executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
-    except Exception:
-        logger.exception("executor.start_polling failed")
-
-import asyncio
-
-async def main():
-    # тут твои настройки бота
-    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
-async def on_startup(dp):
-    logging.info("Bot started")
-
-async def on_shutdown(dp):
-    logging.info("Bot stopped")
+    main()
