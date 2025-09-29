@@ -70,7 +70,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("crypto_bot")
 
 # ---------- Token handling ----------
-async def load_token() -> Optional[str]:
+def load_token() -> Optional[str]:
     """Load TELEGRAM_TOKEN from env or token.txt; if interactive, ask and save."""
     token = os.getenv("TELEGRAM_TOKEN")
     if token:
@@ -1048,6 +1048,6 @@ if __name__ == "__main__":
 
 async def on_startup(dp):
     logging.info("Bot started")
-    
+
 async def on_shutdown(dp):
     logging.info("Bot stopped")
