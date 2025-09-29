@@ -500,12 +500,12 @@ def build_candlestick_chart(symbol: str, timeframe: str = "1m", points: int = 20
 
 # ---------- Bot handlers: commands + callbacks ----------
 @dp.message_handler(commands=['start', 'help'])
-def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message):
     try:
         add_user(message.chat.id)
         send_text = ("👋 Привет! Я крипто-бот.\n\n"
                      "Управление через кнопки. Нажми кнопку ниже.")
-        bot.send_message(message.chat.id, send_text, reply_markup=main_menu_kb())
+        await bot.send_message(message.chat.id, send_text, reply_markup=main_menu_kb())
     except Exception:
         logger.exception("cmd_start error")
 
@@ -1045,3 +1045,9 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+async def on_startup(dp):
+    logging.info("Bot started")
+
+async def on_shutdown(dp):
+    logging.info("Bot stopped")
