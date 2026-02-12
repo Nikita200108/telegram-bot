@@ -204,6 +204,25 @@ def main_bot():
         except Exception as e:
             logger.error(f"Ошибка Long Polling: {e}")
             time.sleep(5)
+async def main():
+    """Основная функция запуска"""
+    # 1. Инициализируем базу данных
+    await init_db()
+    
+    # 2. Запускаем фоновые задачи (мониторинг цен)
+    # Если у вас мониторинг асинхронный:
+    asyncio.create_task(price_monitor_loop())
+    
+    # 3. Запускаем самого бота
+    # Здесь должна быть функция, которая запускает получение обновлений
+    await start_bot() 
 
 if __name__ == "__main__":
-    main_bot()
+    import asyncio
+    try:
+        # Это современный и безопасный способ запуска асинхронных программ
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен")
+    except Exception as e:
+        logger.error(f"Критическая ошибка при запуске: {e}")
