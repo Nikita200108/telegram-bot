@@ -7,14 +7,14 @@ import json
 import aiohttp
 import ccxt.async_support as ccxt
 import pandas as pd
-import pandas_core.common # фикс для некоторых версий
+# Строка с pandas_core удалена, она вызывала ошибку
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = "8054728348:AAHM1awWcJluyjkLPmxSSCVoP_KzsiqjwP8" 
-ADMIN_USERNAME = "USERNAME_АДМИНА" # Без @, например: durov
+ADMIN_USERNAME = "Nikita_Fomenk" # Без @, например: durov
 DB_PATH = "terminal_v3.sqlite"
 CHECK_INTERVAL = 1  # Частота проверки (сек)
 
@@ -24,20 +24,14 @@ logger = logging.getLogger("CryptoBot")
 
 exchange = ccxt.mexc({'enableRateLimit': True})
 
-# Глобальные переменные состояния (чтобы знать, что пользователь вводит)
+# Глобальные переменные состояния
 user_states = {} 
-# Возможные состояния:
-# 'WAITING_COIN_ADD' - ждем название монеты для добавления
-# 'WAITING_PRICE_MANUAL_{SYMBOL}' - ждем цену вручную
-# 'WAITING_PERCENT_{SYMBOL}' - ждем процент
 
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # Таблица портфеля (Избранное)
     cur.execute("CREATE TABLE IF NOT EXISTS portfolio (chat_id TEXT, symbol TEXT, UNIQUE(chat_id, symbol))")
-    # Таблица алертов: target - цена, is_persistent - 1 (постоянный) или 0 (одноразовый)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
@@ -51,7 +45,7 @@ async def init_db():
     conn.commit()
     conn.close()
 
-# --- ТЕЛЕГРАМ API (MINI FRAMEWORK) ---
+# --- ТЕЛЕГРАМ API ---
 class BotInterface:
     def __init__(self, token):
         self.url = f"https://api.telegram.org/bot{token}"
@@ -83,12 +77,9 @@ class BotInterface:
         if keyboard: data.add_field('reply_markup', json.dumps(keyboard))
         await session.post(f"{self.url}/sendPhoto", data=data)
 
-    async def delete_msg(self, chat_id, msg_id):
-        await self.request("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
-
 bot = BotInterface(TOKEN)
 
-# --- ЛОГИКА АНАЛИЗА (АВТО-СИГНАЛЫ) ---
+# --- ЛОГИКА АНАЛИЗА (RSI) ---
 def calculate_rsi(prices, period=14):
     delta = prices.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -116,10 +107,9 @@ def dynamic_coin_keyboard(chat_id, action_prefix):
     coins = [r[0] for r in cur.fetchall()]
     conn.close()
     
-    if not coins: return None # Нет монет
+    if not coins: return None
     
     kb = []
-    # Делаем по 2 кнопки в ряд
     for i in range(0, len(coins), 2):
         row = [{"text": coins[i], "callback_data": f"{action_prefix}_{coins[i]}"}]
         if i+1 < len(coins):
@@ -141,12 +131,8 @@ async def start_polling():
 
             for upd in updates["result"]:
                 offset = upd["update_id"] + 1
-                
-                # 1. ОБРАБОТКА НАЖАТИЙ КНОПОК
                 if "callback_query" in upd:
                     await handle_callback(upd["callback_query"])
-                
-                # 2. ОБРАБОТКА ТЕКСТА (ВВОД ЦЕНЫ ИЛИ МОНЕТЫ)
                 elif "message" in upd and "text" in upd["message"]:
                     await handle_message(upd["message"])
 
@@ -160,11 +146,9 @@ async def handle_callback(cb):
     msg_id = cb["message"]["message_id"]
     data = cb["data"]
     
-    # Главное меню
     if data == "main_menu":
         await bot.request("editMessageText", {"chat_id": chat_id, "message_id": msg_id, "text": "💎 <b>Главный Терминал</b>\nВыберите действие:", "reply_markup": main_menu(), "parse_mode": "HTML"})
 
-    # --- 1. ЦЕНА ---
     elif data == "menu_price":
         kb = dynamic_coin_keyboard(chat_id, "getprice")
         if not kb:
@@ -177,13 +161,12 @@ async def handle_callback(cb):
         try:
             tick = await exchange.fetch_ticker(sym)
             p = tick['last']
-            await bot.send_msg(chat_id, f"💰 <b>{sym}</b>\nЦена: <code>{p}$</code>\nИзм. 24ч: {tick['percentage']:.2f}%")
+            perc = tick['percentage']
+            await bot.send_msg(chat_id, f"💰 <b>{sym}</b>\nЦена: <code>{p}$</code>\nИзм. 24ч: {perc:.2f}%")
         except:
             await bot.send_msg(chat_id, "❌ Ошибка получения цены.")
 
-    # --- 2. МОИ МОНЕТЫ ---
     elif data == "menu_portfolio":
-        # Показываем список и кнопки Удалить/Добавить
         conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
         cur.execute("SELECT symbol FROM portfolio WHERE chat_id=?", (str(chat_id),))
         coins = [r[0] for r in cur.fetchall()]
@@ -211,10 +194,8 @@ async def handle_callback(cb):
         sym = data.split("_")[1]
         conn = sqlite3.connect(DB_PATH); conn.execute("DELETE FROM portfolio WHERE chat_id=? AND symbol=?", (str(chat_id), sym)); conn.commit(); conn.close()
         await bot.send_msg(chat_id, f"🗑 {sym} удалена из портфеля.")
-        # Возврат в портфель
         await handle_callback({"message": {"chat": {"id": chat_id}, "message_id": msg_id}, "data": "menu_portfolio"})
 
-    # --- 3. СОЗДАТЬ АЛЕРТ ---
     elif data == "menu_create_alert":
         kb = dynamic_coin_keyboard(chat_id, "newalert")
         if not kb: await bot.send_msg(chat_id, "Сначала добавьте монеты в портфель!", back_btn()); return
@@ -222,7 +203,6 @@ async def handle_callback(cb):
 
     elif data.startswith("newalert_"):
         sym = data.split("_")[1]
-        # Выбор: Ручная цена или Процент
         kb = {"inline_keyboard": [
             [{"text": "✍️ Ввести цену вручную", "callback_data": f"setalert_manual_{sym}"}],
             [{"text": "🔢 Изменение в %", "callback_data": f"setalert_percent_{sym}"}],
@@ -240,7 +220,6 @@ async def handle_callback(cb):
         user_states[chat_id] = f"WAITING_PERCENT_{sym}"
         await bot.send_msg(chat_id, f"Напишите процент изменения для {sym} (например: <code>5</code> для +5% или <code>-3</code> для -3%):")
 
-    # --- 4. УПРАВЛЕНИЕ АЛЕРТАМИ ---
     elif data == "menu_my_alerts":
         conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
         cur.execute("SELECT id, symbol, target, is_persistent FROM alerts WHERE chat_id=?", (str(chat_id),))
@@ -274,7 +253,6 @@ async def handle_callback(cb):
         conn.commit(); conn.close()
         await handle_callback({"message": {"chat": {"id": chat_id}, "message_id": msg_id}, "data": "menu_my_alerts"})
 
-    # --- 5. ГРАФИКИ ---
     elif data == "menu_charts":
         kb = dynamic_coin_keyboard(chat_id, "selectchart")
         if not kb: await bot.send_msg(chat_id, "Добавьте монеты в портфель, чтобы видеть графики.", back_btn())
@@ -282,7 +260,6 @@ async def handle_callback(cb):
 
     elif data.startswith("selectchart_"):
         sym = data.split("_")[1]
-        # Выбор таймфрейма
         tf_kb = {"inline_keyboard": [
             [{"text": "15m", "callback_data": f"genchart_{sym}_15m"}, {"text": "1h", "callback_data": f"genchart_{sym}_1h"}],
             [{"text": "4h", "callback_data": f"genchart_{sym}_4h"}, {"text": "1d", "callback_data": f"genchart_{sym}_1d"}],
@@ -291,8 +268,14 @@ async def handle_callback(cb):
         await bot.request("editMessageText", {"chat_id": chat_id, "message_id": msg_id, "text": f"📈 Выберите таймфрейм для {sym}:", "reply_markup": tf_kb})
 
     elif data.startswith("genchart_"):
-        _, sym, tf = data.split("_")
+        parts = data.split("_")
+        sym = parts[1]
+        tf = parts[2]
         await generate_and_send_chart(chat_id, sym, tf)
+
+    elif data == "menu_signals":
+        report = await auto_signal_check(chat_id)
+        await bot.send_msg(chat_id, report, back_btn())
 
 # --- ГЕНЕРАЦИЯ ГРАФИКА ---
 async def generate_and_send_chart(chat_id, symbol, timeframe):
@@ -324,14 +307,12 @@ async def handle_message(msg):
     chat_id = msg["chat"]["id"]
     text = msg["text"].strip()
     
-    # Сначала проверяем состояния
     state = user_states.get(chat_id)
     
     if state == "WAITING_COIN_ADD":
         sym = text.upper()
         if "/" not in sym: sym += "/USDT"
         try:
-            # Проверяем на бирже
             await exchange.fetch_ticker(sym)
             conn = sqlite3.connect(DB_PATH)
             conn.execute("INSERT OR IGNORE INTO portfolio (chat_id, symbol) VALUES (?, ?)", (str(chat_id), sym))
@@ -359,7 +340,7 @@ async def handle_message(msg):
         try:
             percent = float(text)
             ticker = await exchange.fetch_ticker(sym)
-            curr = ticker['last']
+            curr = float(ticker['last'])
             target = curr * (1 + percent/100)
             
             conn = sqlite3.connect(DB_PATH)
@@ -378,7 +359,6 @@ async def handle_message(msg):
 # --- МОНИТОРИНГ ЦЕН ---
 async def price_monitor_loop():
     last_prices = {}
-    
     while True:
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -388,36 +368,28 @@ async def price_monitor_loop():
             conn.close()
 
             if alerts:
-                # Собираем уникальные символы
                 symbols = list(set([a[2] for a in alerts]))
-                
                 for sym in symbols:
                     ticker = await exchange.fetch_ticker(sym)
                     curr_price = float(ticker['last'])
                     
                     if sym in last_prices:
                         old_price = last_prices[sym]
-                        
                         for aid, chat_id, s, target, persist in alerts:
                             if s == sym:
-                                # Проверка пересечения
                                 if (old_price < target <= curr_price) or (old_price > target >= curr_price):
                                     await bot.send_msg(chat_id, f"🚨 <b>СИГНАЛ!</b>\n{sym} пробил уровень <b>{target}$</b>\nТекущая цена: {curr_price}$")
-                                    
                                     if not persist:
                                         c = sqlite3.connect(DB_PATH)
                                         c.execute("DELETE FROM alerts WHERE id=?", (aid,))
                                         c.commit(); c.close()
-                    
                     last_prices[sym] = curr_price
-            
             await asyncio.sleep(CHECK_INTERVAL)
         except Exception as e:
             logger.error(f"Monitor error: {e}")
             await asyncio.sleep(5)
 
 # --- АВТО-СИГНАЛЫ (RSI) ---
-# Эта функция вызывается кнопкой "Авто-сигналы"
 async def auto_signal_check(chat_id):
     conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
     cur.execute("SELECT symbol FROM portfolio WHERE chat_id=?", (str(chat_id),))
@@ -433,15 +405,12 @@ async def auto_signal_check(chat_id):
             ohlcv = await exchange.fetch_ohlcv(sym, '1h', limit=20)
             df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
             rsi = calculate_rsi(df['c']).iloc[-1]
-            
             status = "⚪️ Нейтрально"
             if rsi > 70: status = "🔴 <b>ПРОДАВАТЬ</b> (Перекуплен)"
             elif rsi < 30: status = "🟢 <b>ПОКУПАТЬ</b> (Перепродан)"
-            
             report += f"• {sym}: RSI {rsi:.1f} -> {status}\n"
         except:
             report += f"• {sym}: Ошибка данных\n"
-    
     return report
 
 # --- ЗАПУСК ---
@@ -452,15 +421,8 @@ async def main():
     except: pass
     
     await init_db()
-    
-    # Дополнительная задача для кнопок авто-сигналов
-    # (В реальном коде это должно быть внутри handle_callback, но здесь упростим)
-    
     logger.info("Система запущена.")
-    await asyncio.gather(
-        price_monitor_loop(), 
-        start_polling()
-    )
+    await asyncio.gather(price_monitor_loop(), start_polling())
 
 if __name__ == "__main__":
     try:
