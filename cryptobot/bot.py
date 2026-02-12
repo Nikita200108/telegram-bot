@@ -3,26 +3,21 @@ import asyncio
 import logging
 import sqlite3
 import io
-import time
-from datetime import datetime
-
-# Библиотеки
-import ccxt.async_support as ccxt  # Асинхронная версия CCXT
+import aiohttp  # Асинхронные запросы
+import ccxt.async_support as ccxt
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import requests  # Для отправки файлов в Telegram (простой способ)
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("CryptoBot")
 
 # --- НАСТРОЙКИ ---
-TOKEN = "ВАШ_ТЕЛЕГРАМ_ТОКЕН"  # <--- ВСТАВЬТЕ СВОЙ ТОКЕН
+TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"  # ОБЯЗАТЕЛЬНО ПРОВЕРЬТЕ ТОКЕН
 DB_PATH = "bot_database.sqlite"
-CHECK_INTERVAL = 0.5  # Частота проверки (0.5 сек = 2 раза в секунду)
+CHECK_INTERVAL = 0.5 
 
-# Инициализация биржи (асинхронная)
 exchange = ccxt.mexc({'enableRateLimit': True})
 
 # --- БАЗА ДАННЫХ ---
@@ -30,169 +25,141 @@ async def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY, chat_id TEXT, symbol TEXT, target REAL)")
-    cur.execute("CREATE TABLE IF NOT EXISTS symbols (symbol TEXT PRIMARY KEY)")
-    conn.commit()
-    conn.close()
-    logger.info("База данных инициализирована.")
-
-def get_alerts():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, chat_id, symbol, target FROM alerts")
-    data = cur.fetchall()
-    conn.close()
-    return data
-
-def delete_alert(alert_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
     conn.commit()
     conn.close()
 
-def add_alert_to_db(chat_id, symbol, target):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO alerts (chat_id, symbol, target) VALUES (?, ?, ?)", (chat_id, symbol, target))
-    cur.execute("INSERT OR IGNORE INTO symbols (symbol) VALUES (?)", (symbol,))
-    conn.commit()
-    conn.close()
+# --- АСИНХРОННЫЙ ТЕЛЕГРАМ КЛИЕНТ ---
+class TelegramBot:
+    def __init__(self, token):
+        self.url = f"https://api.telegram.org/bot{token}"
+        self.session = None
 
-# --- ТЕЛЕГРАМ API ---
-async def send_msg(chat_id, text, parse_mode="HTML"):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        logger.error(f"Ошибка отправки сообщения: {e}")
+    async def init_session(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession()
 
-async def send_chart(chat_id, symbol):
-    try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-        df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+    async def send_msg(self, chat_id, text):
+        await self.init_session()
+        try:
+            async with self.session.post(f"{self.url}/sendMessage", json={
+                "chat_id": chat_id, "text": text, "parse_mode": "HTML"
+            }) as resp:
+                return await resp.json()
+        except Exception as e:
+            logger.error(f"Send error: {e}")
 
-        plt.style.use('dark_background')
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(df['ts'], df['close'], color='#00ff88', linewidth=2, label='Price')
-        ax.fill_between(df['ts'], df['close'], color='#00ff88', alpha=0.1)
-        
-        ax.set_title(f"Market Chart: {symbol}", fontsize=14, color='white', pad=20)
-        ax.grid(True, alpha=0.1)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight')
-        buf.seek(0)
-        plt.close()
+    async def send_photo(self, chat_id, buf, caption):
+        await self.init_session()
+        data = aiohttp.FormData()
+        data.add_field('chat_id', str(chat_id))
+        data.add_field('caption', caption)
+        data.add_field('photo', buf, filename='chart.png')
+        try:
+            async with self.session.post(f"{self.url}/sendPhoto", data=data) as resp:
+                return await resp.json()
+        except Exception as e:
+            logger.error(f"Photo error: {e}")
 
-        url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-        requests.post(url, data={'chat_id': chat_id, 'caption': f"📊 График {symbol}"}, files={'photo': buf})
-    except Exception as e:
-        logger.error(f"Ошибка графика: {e}")
-        await send_msg(chat_id, "❌ Не удалось загрузить график.")
+bot = TelegramBot(TOKEN)
 
-# --- МОНИТОРИНГ ЦЕН ---
-last_prices = {}
-
+# --- МОНИТОРИНГ ---
 async def price_monitor_loop():
-    logger.info("Поток мониторинга запущен.")
+    last_prices = {}
     while True:
         try:
-            alerts = get_alerts()
-            if not alerts:
-                await asyncio.sleep(2)
-                continue
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT id, chat_id, symbol, target FROM alerts")
+            alerts = cur.fetchall()
+            conn.close()
 
-            # Получаем уникальные символы для проверки
-            unique_symbols = list(set([a[2] for a in alerts]))
-            
-            for symbol in unique_symbols:
-                ticker = await exchange.fetch_ticker(symbol)
-                new_price = float(ticker['last'])
-                
-                if symbol in last_prices:
-                    old_price = last_prices[symbol]
+            if alerts:
+                symbols = list(set([a[2] for a in alerts]))
+                for symbol in symbols:
+                    ticker = await exchange.fetch_ticker(symbol)
+                    new_price = float(ticker['last'])
                     
-                    # Проверяем каждый алерт для этого символа
-                    for aid, chat_id, sym, target in alerts:
-                        if sym == symbol:
-                            # Пересечение уровня вверх или вниз
-                            if (old_price < target <= new_price) or (old_price > target >= new_price):
-                                await send_msg(chat_id, f"🚀 <b>ЦЕЛЬ ДОСТИГНУТА!</b>\n{symbol} сейчас <b>{new_price}$</b> (Уровень: {target}$)")
-                                delete_alert(aid)
-
-                last_prices[symbol] = new_price
+                    if symbol in last_prices:
+                        old_price = last_prices[symbol]
+                        for aid, chat_id, sym, target in alerts:
+                            if sym == symbol:
+                                if (old_price < target <= new_price) or (old_price > target >= new_price):
+                                    await bot.send_msg(chat_id, f"🔔 <b>ЦЕЛЬ!</b> {symbol}: {new_price}$")
+                                    c = sqlite3.connect(DB_PATH); c.execute("DELETE FROM alerts WHERE id=?", (aid,)); c.commit(); c.close()
+                    last_prices[symbol] = new_price
             
             await asyncio.sleep(CHECK_INTERVAL)
         except Exception as e:
-            logger.error(f"Ошибка монитора: {e}")
+            logger.error(f"Monitor error: {e}")
             await asyncio.sleep(5)
 
-# --- ОБРАБОТКА КОМАНД ---
-async def start_bot():
-    offset = 0
-    logger.info("Бот начал опрос сообщений (Polling)...")
+# --- ГРАФИКИ ---
+async def send_chart(chat_id, symbol):
+    try:
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='1h', limit=40)
+        df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        
+        plt.style.use('dark_background')
+        plt.figure(figsize=(10, 5))
+        plt.plot(df['ts'], df['close'], color='#00ff88')
+        plt.grid(alpha=0.2)
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close()
+        await bot.send_photo(chat_id, buf, f"📊 {symbol}")
+    except:
+        await bot.send_msg(chat_id, "❌ Ошибка графика")
+
+# --- ОБРАБОТКА ОБНОВЛЕНИЙ ---
+async def start_polling():
+    offset = -1 # Очищаем старые сообщения при запуске
+    logger.info("Polling started...")
+    await bot.init_session()
+    
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={offset}&timeout=20"
-            response = requests.get(url, timeout=25).json()
-            
-            for update in response.get("result", []):
-                offset = update["update_id"] + 1
-                if "message" not in update: continue
+            async with bot.session.get(f"{bot.url}/getUpdates", params={"offset": offset, "timeout": 20}) as resp:
+                data = await resp.json()
                 
-                msg = update["message"]
-                chat_id = msg["chat"]["id"]
-                text = msg.get("text", "")
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    msg = update.get("message")
+                    if not msg or "text" not in msg: continue
+                    
+                    chat_id = msg["chat"]["id"]
+                    text = msg["text"].strip()
 
-                if text == "/start":
-                    await send_msg(chat_id, "🤖 <b>Я Крипто-Бот.</b>\n\n• Чтобы поставить алерт: <code>BTC 65000</code>\n• Чтобы увидеть график: <code>/chart BTC/USDT</code>")
-                
-                elif text.startswith("/chart"):
-                    parts = text.split()
-                    symbol = parts[1].upper() if len(parts) > 1 else "BTC/USDT"
-                    if "/" not in symbol: symbol += "/USDT"
-                    await send_chart(chat_id, symbol)
-
-                # Логика алертов: "BTC 68000"
-                elif len(text.split()) == 2:
-                    try:
-                        sym, target = text.split()
-                        sym = sym.upper()
+                    if text == "/start":
+                        await bot.send_msg(chat_id, "✅ <b>Бот работает!</b>\n\nПиши: <code>BTC 70000</code>\nИли: <code>/chart BTC/USDT</code>")
+                    
+                    elif text.startswith("/chart"):
+                        sym = text.split()[1].upper() if len(text.split()) > 1 else "BTC/USDT"
                         if "/" not in sym: sym += "/USDT"
-                        price_target = float(target)
-                        
-                        add_alert_to_db(chat_id, sym, price_target)
-                        await send_msg(chat_id, f"✅ Алерт установлен: <b>{sym}</b> при достижении <b>{price_target}$</b>")
-                    except ValueError:
-                        continue # Не формат алерта
-
+                        await send_chart(chat_id, sym)
+                    
+                    elif len(text.split()) == 2:
+                        try:
+                            s, t = text.split(); s = s.upper()
+                            if "/" not in s: s += "/USDT"
+                            conn = sqlite3.connect(DB_PATH); conn.execute("INSERT INTO alerts (chat_id, symbol, target) VALUES (?,?,?)", (chat_id, s, float(t))); conn.commit(); conn.close()
+                            await bot.send_msg(chat_id, f"🎯 Слежу за {s} на уровне {t}")
+                        except: pass
         except Exception as e:
-            logger.error(f"Ошибка Polling: {e}")
+            logger.error(f"Polling error: {e}")
             await asyncio.sleep(5)
 
-# --- ГЛАВНЫЙ ЗАПУСК ---
+# --- ЗАПУСК ---
 async def main():
     try:
-        # Импортируем uvloop внутри, так как он специфичен для контейнера
         import uvloop
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        logger.info("Используется uvloop")
-    except ImportError:
-        pass
-
-    await init_db()
+    except: pass
     
-    # Запускаем две задачи одновременно
-    await asyncio.gather(
-        price_monitor_loop(),
-        start_bot()
-    )
+    await init_db()
+    await asyncio.gather(price_monitor_loop(), start_polling())
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
