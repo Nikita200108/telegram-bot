@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("CryptoBot")
 
 # --- НАСТРОЙКИ ---
-TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"  # ОБЯЗАТЕЛЬНО ПРОВЕРЬТЕ ТОКЕН
+TOKEN = "8054728348:AAHM1awWcJluyjkLPmxSSCVoP_KzsiqjwP8"  # ОБЯЗАТЕЛЬНО ПРОВЕРЬТЕ ТОКЕН
 DB_PATH = "bot_database.sqlite"
 CHECK_INTERVAL = 0.5 
 
@@ -163,4 +163,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
