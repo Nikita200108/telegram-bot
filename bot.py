@@ -1,236 +1,157 @@
-import asyncio
-import logging
 import sqlite3
-import io
-import json
-import aiohttp
-import ccxt.async_support as ccxt
+import ccxt
 import pandas as pd
-import mplfinance as mpf
-import matplotlib.pyplot as plt
-from datetime import datetime
+import requests
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = "8054728348:AAHM1awWcJluyjkLPmxSSCVoP_KzsiqjwP8"
-ADMIN_USERNAME = "Nikita_Fomenk"
-DB_PATH = "terminal_v6.sqlite"
-CHECK_INTERVAL = 0.5
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-logger = logging.getLogger("CryptoTerminal")
-
-exchange = ccxt.mexc({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
-user_states = {}
+CRYPTO_PANIC_KEY = "c712f3524949cf2ed176a248158395e96028b7f8"
 
 # --- БАЗА ДАННЫХ ---
-async def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS portfolio (chat_id TEXT, symbol TEXT, UNIQUE(chat_id, symbol))")
-    cur.execute("CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, symbol TEXT, target REAL, is_persistent INTEGER DEFAULT 0)")
+def init_db():
+    conn = sqlite3.connect('crypto_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS subscriptions 
+                      (user_id INTEGER, symbol TEXT, PRIMARY KEY (user_id, symbol))''')
     conn.commit()
     conn.close()
 
-# --- ТЕЛЕГРАМ API ---
-class BotInterface:
-    def __init__(self, token):
-        self.url = f"https://api.telegram.org/bot{token}"
-        self.session = None
+def get_user_subs(user_id):
+    conn = sqlite3.connect('crypto_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT symbol FROM subscriptions WHERE user_id = ?', (user_id,))
+    subs = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return subs
 
-    async def get_session(self):
-        if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=100))
-        return self.session
+def add_subscription(user_id, symbol):
+    conn = sqlite3.connect('crypto_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO subscriptions (user_id, symbol) VALUES (?, ?)', (user_id, symbol))
+    conn.commit()
+    conn.close()
 
-    async def request(self, method, payload=None, data=None):
-        session = await self.get_session()
-        try:
-            if data:
-                async with session.post(f"{self.url}/{method}", data=data) as resp: return await resp.json()
-            async with session.post(f"{self.url}/{method}", json=payload) as resp: return await resp.json()
-        except: return {}
-
-    async def send_msg(self, chat_id, text, keyboard=None):
-        return await self.request("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": keyboard})
-
-bot = BotInterface(TOKEN)
-
-# --- АНАЛИТИКА И МОНИТОРИНГ (ВНУТРИ ФАЙЛА) ---
-async def get_ai_signals(symbol):
+# --- АНАЛИЗ ---
+def get_market_sentiment(coin_ticker):
+    url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_PANIC_KEY}&currencies={coin_ticker}&kind=news"
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, '1h', limit=50)
-        df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-        delta = df['c'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
-        
-        ma20 = df['c'].rolling(20).mean()
-        std20 = df['c'].rolling(20).std()
-        upper_bb = (ma20 + (std20 * 2)).iloc[-1]
-        lower_bb = (ma20 - (std20 * 2)).iloc[-1]
-        curr_price = df['c'].iloc[-1]
-        
-        signal = "⚖️ Нейтрально"
-        if rsi < 35 or curr_price <= lower_bb: signal = "🟢 ПОКУПАТЬ (Long)"
-        elif rsi > 65 or curr_price >= upper_bb: signal = "🔴 ПРОДАВАТЬ (Short)"
-        
-        return f"<b>{symbol}</b>\nСигнал: {signal}\nRSI: {rsi:.1f}"
-    except: return f"⚠️ {symbol}: Ошибка анализа"
+        response = requests.get(url, timeout=5).json()
+        pos, neg = 0, 0
+        for post in response.get('results', [])[:5]:
+            v = post.get('votes', {})
+            pos += v.get('positive', 0) + v.get('bullish', 0)
+            neg += v.get('negative', 0) + v.get('bearish', 0)
+        return 1 if pos > neg else (-1 if neg > pos else 0)
+    except: return 0
 
-async def monitor_logic():
-    last_prices = {}
-    while True:
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            alerts = conn.execute("SELECT id, chat_id, symbol, target, is_persistent FROM alerts").fetchall()
-            conn.close()
-            if alerts:
-                symbols = list(set([a[2] for a in alerts]))
-                tickers = await asyncio.gather(*[exchange.fetch_ticker(s) for s in symbols], return_exceptions=True)
-                for t in tickers:
-                    if isinstance(t, dict):
-                        s = t['symbol']; cp = float(t['last'])
-                        if s in last_prices:
-                            for aid, cid, sym, tar, per in alerts:
-                                if sym == s and ((last_prices[s] < tar <= cp) or (last_prices[s] > tar >= cp)):
-                                    await bot.send_msg(cid, f"🚨 <b>АЛЕРТ!</b>\n{s} пробил уровень {tar}$")
-                                    if not per:
-                                        c = sqlite3.connect(DB_PATH); c.execute("DELETE FROM alerts WHERE id=?", (aid,)); c.commit(); c.close()
-                        last_prices[s] = cp
-            await asyncio.sleep(CHECK_INTERVAL)
-        except: await asyncio.sleep(1)
+def generate_advanced_signal(df, symbol):
+    # Технические индикаторы
+    ema12 = df['close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['close'].ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
 
-# --- ГРАФИКИ ---
-async def send_pro_chart(chat_id, symbol, timeframe):
+    sma20 = df['close'].rolling(window=20).mean()
+    std20 = df['close'].rolling(window=20).std()
+    upper_bb = (sma20 + (std20 * 2)).iloc[-1]
+    lower_bb = (sma20 - (std20 * 2)).iloc[-1]
+
+    recent_high = df['high'].tail(50).max()
+    recent_low = df['low'].tail(50).min()
+    price_range = recent_high - recent_low
+    current_price = df['close'].iloc[-1]
+    sentiment = get_market_sentiment(symbol.split('/')[0])
+
+    score = 0
+    details = []
+    if macd_line.iloc[-1] > signal_line.iloc[-1]: score += 1; details.append("📈 MACD: Бычий")
+    else: score -= 1; details.append("📉 MACD: Медвежий")
+    if rsi < 35: score += 2; details.append(f"🆘 RSI ({rsi:.1f}): Перепродан")
+    elif rsi > 65: score -= 2; details.append(f"🔥 RSI ({rsi:.1f}): Перекуплен")
+    if current_price <= lower_bb * 1.005: score += 1; details.append("🛡 У нижней границы Bollinger")
+    if sentiment > 0: score += 1; details.append("📰 Новости: Позитив")
+
+    if score >= 2:
+        verdict = "🟢 **СИЛЬНЫЙ LONG**"
+        tp1 = recent_low + (price_range * 0.618)
+        sl = recent_low * 0.98
+        targets = f"🎯 TP1: `{tp1:.4f}`\n🛑 SL: `{sl:.4f}`"
+    elif score <= -2:
+        verdict = "🔴 **СИЛЬНЫЙ SHORT**"
+        tp1 = recent_high - (price_range * 0.618)
+        sl = recent_high * 1.02
+        targets = f"🎯 TP1: `{tp1:.4f}`\n🛑 SL: `{sl:.4f}`"
+    else:
+        verdict = "🟡 **НЕЙТРАЛЬНО**"
+        targets = "Ждем подтверждения"
+
+    return f"📊 **Анализ {symbol}**\nЦена: `{current_price}`\n\nВердикт: {verdict}\nИндикаторы:\n" + "\n".join(details) + f"\n\n--- УРОВНИ ---\n{targets}"
+
+# --- ОБРАБОТЧИКИ ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💎 Бот готов.\n/add BTC - подписаться\n/check BTC - анализ\n/list - мои подписки")
+
+async def add_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return await update.message.reply_text("Пример: /add BTC")
+    symbol = f"{context.args[0].upper()}/USDT"
+    add_subscription(update.effective_user.id, symbol)
+    await update.message.reply_text(f"✅ Подписка на {symbol} активна.")
+
+async def list_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subs = get_user_subs(update.effective_user.id)
+    msg = "📋 **Ваши подписки:**\n\n" + "\n".join(subs) if subs else "У вас нет активных подписок."
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def check_coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return await update.message.reply_text("Пример: /check BTC")
+    symbol = f"{context.args[0].upper()}/USDT"
+    await send_analysis(update, symbol)
+
+async def send_analysis(update_or_query, symbol, edit=False):
+    ex = ccxt.binance()
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-        df = pd.DataFrame(ohlcv, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        df['Date'] = pd.to_datetime(df['Date'], unit='ms')
-        df.set_index('Date', inplace=True)
+        bars = ex.fetch_ohlcv(symbol, timeframe='1h', limit=100)
+        df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+        report = generate_advanced_signal(df, symbol)
+        keyboard = [[InlineKeyboardButton("🔄 Обновить данные", callback_data=f"refresh_{symbol}")]]
+        markup = InlineKeyboardMarkup(keyboard)
         
-        mc = mpf.make_marketcolors(up='#00ff88', down='#ff3355', inherit=True)
-        s = mpf.make_mpf_style(marketcolors=mc, gridstyle='--', gridcolor='#333333', facecolor='#0b0e11')
-        
-        buf = io.BytesIO()
-        mpf.plot(df, type='candle', style=s, volume=True, figsize=(12, 7), savefig=dict(fname=buf, format='png'))
-        buf.seek(0)
-        
-        data = aiohttp.FormData()
-        data.add_field('chat_id', str(chat_id))
-        data.add_field('photo', buf, filename='chart.png')
-        data.add_field('caption', f"📊 {symbol} [{timeframe}]")
-        await bot.request("sendPhoto", data=data)
-    except Exception as e:
-        await bot.send_msg(chat_id, f"❌ Ошибка графика: {e}")
-
-# --- КЛАВИАТУРЫ ---
-def main_kb():
-    return {"inline_keyboard": [
-        [{"text": "💰 Текущие цены", "callback_data": "menu_all_prices"}, {"text": "📊 Графики", "callback_data": "menu_charts"}],
-        [{"text": "💼 Мои монеты", "callback_data": "menu_port"}, {"text": "🔔 Создать Алерт", "callback_data": "menu_newalert"}],
-        [{"text": "📋 Мои Алерты", "callback_data": "menu_myalerts"}, {"text": "🧠 Сигналы AI", "callback_data": "menu_signals"}],
-        [{"text": "🎓 КУРСЫ АДМИНА", "url": f"https://t.me/{ADMIN_USERNAME}"}]
-    ]}
-
-def tf_kb(symbol):
-    tfs = [["1m", "3m", "5m"], ["15m", "30m", "1h"], ["4h", "1d"]]
-    kb = [[{"text": t, "callback_data": f"genchart_{symbol}_{t}"} for t in row] for row in tfs]
-    kb.append([{"text": "⬅️ Назад", "callback_data": "menu_charts"}])
-    return {"inline_keyboard": kb}
-
-# --- ОБРАБОТЧИК CALLBACK ---
-async def handle_callback(cb):
-    chat_id = cb["message"]["chat"]["id"]; data = cb["data"]; mid = cb["message"]["message_id"]
-
-    if data == "home":
-        await bot.request("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": "💎 <b>CRYPTO TERMINAL</b>", "reply_markup": main_kb(), "parse_mode": "HTML"})
-
-    elif data == "menu_all_prices":
-        conn = sqlite3.connect(DB_PATH); coins = [r[0] for r in conn.execute("SELECT symbol FROM portfolio WHERE chat_id=?", (str(chat_id),)).fetchall()]; conn.close()
-        if not coins:
-            await bot.send_msg(chat_id, "❌ Сначала добавьте монеты в портфель.")
+        if edit:
+            await update_or_query.edit_message_text(report, reply_markup=markup, parse_mode='Markdown')
         else:
-            tickers = await asyncio.gather(*[exchange.fetch_ticker(s) for s in coins])
-            msg = "<b>💰 Текущие курсы:</b>\n\n"
-            for t in tickers: msg += f"• {t['symbol']}: <code>{t['last']}$</code> ({t['percentage']}%)\n"
-            await bot.send_msg(chat_id, msg, {"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "home"}]]})
+            await update_or_query.message.reply_text(report, reply_markup=markup, parse_mode='Markdown')
+    except:
+        msg = "❌ Ошибка получения данных. Проверьте тикер."
+        if edit: await update_or_query.edit_message_text(msg)
+        else: await update_or_query.message.reply_text(msg)
 
-    elif data == "menu_port":
-        conn = sqlite3.connect(DB_PATH); coins = [r[0] for r in conn.execute("SELECT symbol FROM portfolio WHERE chat_id=?", (str(chat_id),)).fetchall()]; conn.close()
-        if not coins:
-            kb = {"inline_keyboard": [
-                [{"text": "BTC", "callback_data": "quick_BTC/USDT"}, {"text": "ETH", "callback_data": "quick_ETH/USDT"}],
-                [{"text": "SOL", "callback_data": "quick_SOL/USDT"}, {"text": "TON", "callback_data": "quick_TON/USDT"}],
-                [{"text": "✍️ Ввести вручную", "callback_data": "manual_add"}],
-                [{"text": "⬅️ Назад", "callback_data": "home"}]
-            ]}
-            await bot.request("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": "💼 Портфель пуст. Добавьте ТОП монеты:", "reply_markup": kb})
-        else:
-            kb = [[{"text": f"❌ Удалить {c}", "callback_data": f"del_{c}"}] for c in coins]
-            kb.append([{"text": "➕ Добавить монету", "callback_data": "manual_add"}])
-            kb.append([{"text": "⬅️ Назад", "callback_data": "home"}])
-            await bot.request("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": "💼 <b>Управление портфелем:</b>", "reply_markup": {"inline_keyboard": kb}, "parse_mode": "HTML"})
-
-    elif data.startswith("quick_"):
-        sym = data.split("_")[1]
-        conn = sqlite3.connect(DB_PATH); conn.execute("INSERT OR IGNORE INTO portfolio VALUES (?,?)", (str(chat_id), sym)); conn.commit(); conn.close()
-        cb["data"] = "menu_port"; await handle_callback(cb)
-
-    elif data == "manual_add":
-        user_states[chat_id] = "WAIT_ADD"
-        await bot.send_msg(chat_id, "✍️ Введите тикер (например SOL):")
-
-    elif data.startswith("del_"):
-        sym = data.split("_")[1]
-        conn = sqlite3.connect(DB_PATH); conn.execute("DELETE FROM portfolio WHERE chat_id=? AND symbol=?", (str(chat_id), sym)); conn.commit(); conn.close()
-        cb["data"] = "menu_port"; await handle_callback(cb)
-
-    elif data == "menu_charts":
-        conn = sqlite3.connect(DB_PATH); coins = [r[0] for r in conn.execute("SELECT symbol FROM portfolio WHERE chat_id=?", (str(chat_id),)).fetchall()]; conn.close()
-        if not coins: await bot.send_msg(chat_id, "Сначала добавьте монеты!"); return
-        kb = [[{"text": c, "callback_data": f"seltf_{c}"}] for c in coins] + [[{"text": "⬅️ Назад", "callback_data": "home"}]]
-        await bot.request("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": "Выберите монету для графика:", "reply_markup": {"inline_keyboard": kb}})
-
-    elif data.startswith("seltf_"):
-        sym = data.split("_")[1]
-        await bot.request("editMessageText", {"chat_id": chat_id, "message_id": mid, "text": f"📈 Таймфрейм для {sym}:", "reply_markup": tf_kb(sym)})
-
-    elif data.startswith("genchart_"):
-        _, sym, tf = data.split("_")
-        await send_pro_chart(chat_id, sym, tf)
-
-    elif data == "menu_signals":
-        conn = sqlite3.connect(DB_PATH); coins = [r[0] for r in conn.execute("SELECT symbol FROM portfolio WHERE chat_id=?", (str(chat_id),)).fetchall()]; conn.close()
-        if not coins: await bot.send_msg(chat_id, "Портфель пуст."); return
-        for c in coins:
-            sig = await get_ai_signals(c)
-            await bot.send_msg(chat_id, sig)
-
-# --- СООБЩЕНИЯ ---
-async def handle_msg(m):
-    cid = m["chat"]["id"]; txt = m.get("text", "")
-    if txt == "/start": await bot.send_msg(cid, "💎 <b>CRYPTO TERMINAL v6.1</b>", main_kb())
-    elif user_states.get(cid) == "WAIT_ADD":
-        sym = txt.upper() + "/USDT" if "/" not in txt else txt.upper()
-        conn = sqlite3.connect(DB_PATH); conn.execute("INSERT OR IGNORE INTO portfolio VALUES (?,?)", (str(cid), sym)); conn.commit(); conn.close()
-        await bot.send_msg(cid, f"✅ {sym} добавлена!"); del user_states[cid]
+async def button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    # Моментальный ответ, чтобы кнопка не «залипала»
+    await query.answer("Обновляю...") 
+    
+    if query.data.startswith("refresh_"):
+        symbol = query.data.split("_")[1]
+        await send_analysis(query, symbol, edit=True)
 
 # --- ЗАПУСК ---
-async def main():
-    await init_db()
-    asyncio.create_task(monitor_logic())
-    offset = -1
-    logger.info("Бот запущен...")
-    while True:
-        try:
-            res = await bot.request("getUpdates", {"offset": offset, "timeout": 20})
-            for u in res.get("result", []):
-                offset = u["update_id"] + 1
-                if "callback_query" in u: await handle_callback(u["callback_query"])
-                if "message" in u: await handle_msg(u["message"])
-        except: await asyncio.sleep(1)
-
-if __name__ == "__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: pass
+if __name__ == '__main__':
+    init_db()
+    app = ApplicationBuilder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add_coin))
+    app.add_handler(CommandHandler("list", list_subs)) # ТЕПЕРЬ ДОБАВЛЕНО
+    app.add_handler(CommandHandler("check", check_coin))
+    app.add_handler(CallbackQueryHandler(button_tap))
+    
+    print("Бот запущен...")
+    app.run_polling()
