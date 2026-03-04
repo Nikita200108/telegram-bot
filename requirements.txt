@@ -1,18 +1,6 @@
-     # или подходящая 3.x версия, проверь совместимость
-fastapi
-uvicorn[standard]
-aiosqlite
+python-telegram-bot[job-queue]
 ccxt
 pandas
-numpy
-matplotlib
-mplfinance
-python-dotenv
 requests
-gunicorn
-
-aiogram==2.25.1
-
-apscheduler==3.10.4
 
 
