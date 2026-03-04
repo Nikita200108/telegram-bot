@@ -7,8 +7,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # --- КОНФИГУРАЦИЯ ---
-TOKEN = "8054728348:AAHM1awWcJluyjkLPmxSSCVoP_KzsiqjwP8"
-CRYPTO_PANIC_KEY = "c712f3524949cf2ed176a248158395e96028b7f8"
+import os
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CRYPTO_PANIC_KEY = os.getenv("CRYPTO_PANIC_KEY")
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
@@ -155,3 +156,4 @@ if __name__ == '__main__':
     
     print("Бот запущен...")
     app.run_polling()
+
